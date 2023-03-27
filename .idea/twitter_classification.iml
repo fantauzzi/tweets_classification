@@ -6,8 +6,10 @@
       <excludeFolder url="file://$MODULE_DIR$/models/distilbert-base-uncased-finetuned-emotion" />
       <excludeFolder url="file://$MODULE_DIR$/mlruns" />
       <excludeFolder url="file://$MODULE_DIR$/models/saved_model" />
+      <excludeFolder url="file://$MODULE_DIR$/src/outputs" />
+      <excludeFolder url="file://$MODULE_DIR$/models" />
     </content>
-    <orderEntry type="inheritedJdk" />
+    <orderEntry type="jdk" jdkName="Python 3.10 (python3.10.7) (6)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>
