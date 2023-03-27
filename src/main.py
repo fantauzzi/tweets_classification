@@ -1,17 +1,36 @@
 from pathlib import Path
 
+import hydra
+import mlflow as mf
 import numpy as np
 import torch
 import transformers
 from datasets import load_dataset
 from matplotlib import pyplot as plt
+from omegaconf import DictConfig
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 
 
-def main():
-    transformers.set_seed(8833)
-    model_file_name = 'saved_model'
+@hydra.main(version_base='1.3', config_path='../config', config_name='params')
+def main(params: DictConfig) -> None:
+    # Absolute path to the repo root in the local filesystem
+    repo_root = Path('..').resolve()
+
+    # Absolute path to the MLFlow tracking dir, currently supported only in the local filesystem
+    tracking_uri = repo_root / params.mlflow.tracking_uri
+
+    models_dir = (repo_root / params.main.models_dir).resolve()
+    mf.set_tracking_uri(tracking_uri)  # set_tracking_uri() expects an absolute path
+
+    # If there is no active run then start one
+    mf.start_run()
+    mf_run = mf.active_run()
+    print(f"Active run name is: {mf_run.info.run_name}")
+
+    if params.transformers.seed is not None:
+        transformers.set_seed(params.transformers.seed)
+    model_file_name = '../models/saved_model'
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != 'cuda':
@@ -19,8 +38,8 @@ def main():
 
     emotions = load_dataset('emotion')
 
-    model_ckpt = 'distilbert-base-uncased'
-    tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+    pretrained_model = params.transformers.pretrained_model
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
 
     def tokenize(batch):
         return tokenizer(batch['text'], padding=True, truncation=True)
@@ -35,7 +54,7 @@ def main():
         already_trained = True
     else:
         print('Resuming from checkpointed model')
-        model = (AutoModelForSequenceClassification.from_pretrained(model_ckpt, num_labels=num_labels).to(device))
+        model = (AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(device))
 
     from sklearn.metrics import accuracy_score, f1_score
 
@@ -48,8 +67,9 @@ def main():
 
     batch_size = 64
     logging_steps = len(emotions_encoded["train"]) // batch_size
-    model_name = f"{model_ckpt}-finetuned-emotion"
-    training_args = TrainingArguments(output_dir=model_name,
+    model_name = f"{pretrained_model}-finetuned-emotion"
+    output_dir = str(models_dir / model_name)
+    training_args = TrainingArguments(output_dir=output_dir,
                                       num_train_epochs=2,
                                       learning_rate=2e-5,
                                       per_device_train_batch_size=batch_size,
@@ -106,9 +126,8 @@ if __name__ == '__main__':
 """
 TODO
 Add a test step -> Done 
-Turn the script into an MLFlow project
-Store hyperparameters in a config. file
-Make runs reproducible via MLFlow
+Turn the script into an MLFlow project -> Done
+Store hyperparameters in a config. file -> Done
 Draw charts of the training and validation loss and the confusion matrix under TensorFlow
 Tune hyperparameters (using some framework/library)
 Version the model

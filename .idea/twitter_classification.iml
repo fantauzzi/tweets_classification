@@ -3,8 +3,9 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/saved_model" />
-      <excludeFolder url="file://$MODULE_DIR$/distilbert-base-uncased-finetuned-emotion" />
+      <excludeFolder url="file://$MODULE_DIR$/models/distilbert-base-uncased-finetuned-emotion" />
       <excludeFolder url="file://$MODULE_DIR$/mlruns" />
+      <excludeFolder url="file://$MODULE_DIR$/models/saved_model" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

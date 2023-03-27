@@ -1,7 +1,8 @@
+models
 saved_model
 mlruns
 distilbert-base-uncased-finetuned-emotion
-
+src/outputs
 ### Python template
 # Byte-compiled / optimized / DLL files
 __pycache__/
