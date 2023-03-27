@@ -1,0 +1,11 @@
+python: "3.10.7"
+build_dependencies:
+  - pip==23.0.1
+dependencies:
+  - mlflow==2.2.2
+  - datasets==2.10.1
+  - matplotlib==3.7.1
+  - numpy==1.23.5
+  - scikit_learn==1.2.2
+  - torch==2.0.0
+  - transformers==4.27.3
