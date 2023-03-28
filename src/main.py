@@ -2,16 +2,16 @@ import logging
 from pathlib import Path
 
 import hydra
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
 import mlflow as mf
 import numpy as np
 import torch
 import transformers
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 from datasets import load_dataset
+from hydra.core.hydra_config import HydraConfig
 from matplotlib import pyplot as plt
+from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score, f1_score
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
@@ -71,6 +71,8 @@ def main(params: DictConfig) -> None:
         print(f'Model f{model_file_name} not found, going to download pre-trained model for fine-tuning')
         model = (AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(device))
 
+    print(model)
+
     def compute_metrics(pred):
         labels = pred.label_ids
         preds = pred.predictions.argmax(-1)
@@ -78,21 +80,25 @@ def main(params: DictConfig) -> None:
         acc = accuracy_score(labels, preds)
         return {"accuracy": acc, "f1": f1}
 
-    batch_size = 64
-    logging_steps = len(emotions_encoded["train"]) // batch_size
+    # logging_steps = len(emotions_encoded["train"]) // params.transformers.batch_size
+    info(f'Training set contains {len(emotions_encoded["train"])} samples')
     model_name = f"{pretrained_model}-finetuned-emotion"
     output_dir = str(models_dir / model_name)
     training_args = TrainingArguments(output_dir=output_dir,
-                                      num_train_epochs=2,
+                                      num_train_epochs=params.transformers.epochs,
                                       learning_rate=2e-5,
-                                      per_device_train_batch_size=batch_size,
-                                      per_device_eval_batch_size=batch_size,
+                                      per_device_train_batch_size=params.transformers.batch_size,
+                                      per_device_eval_batch_size=params.transformers.batch_size,
                                       weight_decay=0.01,
                                       evaluation_strategy="epoch",
                                       disable_tqdm=False,
-                                      logging_steps=logging_steps,
+                                      # logging_steps=logging_steps,
                                       push_to_hub=False,
-                                      log_level="error")
+                                      log_level="error",
+                                      logging_strategy='epoch',
+                                      report_to=['mlflow'],
+                                      logging_first_step=True,
+                                      save_strategy='epoch')
 
     trainer = Trainer(model=model, args=training_args,
                       compute_metrics=compute_metrics,
@@ -106,31 +112,38 @@ def main(params: DictConfig) -> None:
         trainer.save_model(model_file_name)
         already_trained = True
 
-    def plot_confusion_matrix(y_preds, y_true, labels):
+    def plot_confusion_matrix(y_preds, y_true, labels, show=True):
         cm = confusion_matrix(y_true, y_preds, normalize="true")
         fig, ax = plt.subplots(figsize=(6, 6))
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
         disp.plot(cmap="Blues", values_format=".2f", ax=ax, colorbar=False)
         plt.title("Normalized confusion matrix")
-        plt.show()
+        if show:
+            plt.show()
+        return fig
 
     labels = emotions["train"].features["label"].names
 
+    info(f'Validation set contains {len(emotions_encoded["validation"])} samples')
     preds_output_val = trainer.predict(emotions_encoded["validation"])
     info(f'Validation metrics\n{preds_output_val.metrics}')
 
     y_preds_val = np.argmax(preds_output_val.predictions, axis=1)
     y_valid = np.array(emotions_encoded["validation"]["label"])
 
-    plot_confusion_matrix(y_preds_val, y_valid, labels)
+    fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
+    mf.log_figure(fig_val, 'validation_confusion_matrix.png')
 
+    info(f'Test set contains {len(emotions_encoded["test"])} samples')
     preds_output_test = trainer.predict(emotions_encoded["test"])
     info(f'Test metrics\n{preds_output_test.metrics}')
+    mf.log_metrics(preds_output_test.metrics)
 
     y_preds_test = np.argmax(preds_output_test.predictions, axis=1)
     y_test = np.array(emotions_encoded["test"]["label"])
 
-    plot_confusion_matrix(y_preds_test, y_test, labels)
+    fig_test = plot_confusion_matrix(y_preds_test, y_test, labels, False)
+    mf.log_figure(fig_test, 'test_confusion_matrix.png')
 
 
 if __name__ == '__main__':
@@ -142,9 +155,12 @@ Add a test step -> Done
 Turn the script into an MLFlow project -> Done
 Store hyperparameters in a config. file -> Done
 Introduce proper logging -> Done
-Draw charts of the training and validation loss and the confusion matrix under TensorFlow
+Draw charts of the training and validation loss and the confusion matrix under MLFlow -> Done
+Follow Andrej recipe
+Plot charts to MLFlow for debugging of the training process, as per Andrej's lectures
+Implement early stopping
 Tune hyperparameters (using some framework/library)
-Version the model
+Version the model (also the dataset?)
 Give the model an API, deploy it
 Make a GUI via gradio and/or streamlit
 
