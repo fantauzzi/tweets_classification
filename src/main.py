@@ -4,6 +4,7 @@ from pathlib import Path
 import hydra
 import mlflow as mf
 import numpy as np
+import optuna as opt
 import torch
 import transformers
 from datasets import load_dataset
@@ -63,13 +64,19 @@ def main(params: DictConfig) -> None:
 
     num_labels = 6
     already_trained = False
+
+    def model_init(trial):
+        the_model = (AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(device))
+        return the_model
+
     if Path(model_file_name).exists():
         info(f'Loading model from directory f{model_file_name}')
         model = (AutoModelForSequenceClassification.from_pretrained(model_file_name).to(device))
         already_trained = True
     else:
         print(f'Model f{model_file_name} not found, going to download pre-trained model for fine-tuning')
-        model = (AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(device))
+        model = None
+        # model = (AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(device))
 
     print(model)
 
@@ -84,6 +91,15 @@ def main(params: DictConfig) -> None:
     info(f'Training set contains {len(emotions_encoded["train"])} samples')
     model_name = f"{pretrained_model}-finetuned-emotion"
     output_dir = str(models_dir / model_name)
+
+    def optuna_hp_space(trial: opt.trial.Trial) -> dict:
+        hp_space = {
+            "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True),
+            "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [16, 32, 64]),
+        }
+
+        return hp_space
+
     training_args = TrainingArguments(output_dir=output_dir,
                                       num_train_epochs=params.transformers.epochs,
                                       learning_rate=2e-5,
@@ -100,15 +116,25 @@ def main(params: DictConfig) -> None:
                                       logging_first_step=True,
                                       save_strategy='epoch')
 
-    trainer = Trainer(model=model, args=training_args,
+    trainer = Trainer(model=model,
+                      args=training_args,
                       compute_metrics=compute_metrics,
                       train_dataset=emotions_encoded["train"],
                       eval_dataset=emotions_encoded["validation"],
-                      tokenizer=tokenizer)
+                      tokenizer=tokenizer,
+                      model_init=model_init)
+
+    def compute_objective(metrics: dict) -> float:
+        return metrics['eval_f1']
 
     if not already_trained:
-        training_metrics = trainer.train()
-        print(training_metrics)
+        # training_metrics = trainer.train()
+        best_run = trainer.hyperparameter_search(hp_space=optuna_hp_space,
+                                                 n_trials=3,
+                                                 direction='maximize',
+                                                 compute_objective=compute_objective)
+        # print(training_metrics)
+        info(f'Best run: {best_run}')
         trainer.save_model(model_file_name)
         already_trained = True
 
