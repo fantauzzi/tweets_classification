@@ -17,36 +17,47 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trai
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
 def main(params: DictConfig) -> None:
+    """
+    Tune the hyperparameters for best fine-tuning the model
+    :param params: the configuration parameters passed by Hydra
+    """
+
+    ''' Set-up logging and Hydra '''
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
     logger = logging.getLogger()
     info = logger.info
     warning = logger.warning
-
     info(f'Current working directory is {Path.cwd()}')
-
     hydra_output_dir = OmegaConf.to_container(HydraConfig.get().runtime)['output_dir']
     info(f'Output dir is {hydra_output_dir}')
+
+    ''' Set the RNG seed to make runs reproducible '''
+
+    if params.transformers.seed is not None:
+        transformers.set_seed(params.transformers.seed)
+
+    ''' Set various directories '''
 
     # Absolute path to the repo root in the local filesystem
     repo_root = Path('..').resolve()
 
-    # Absolute path to the MLFlow tracking dir, currently supported only in the local filesystem
+    # Absolute path to the MLFlow tracking dir; currently supported only in the local filesystem
     tracking_uri = repo_root / params.mlflow.tracking_uri
-
-    models_dir = (repo_root / params.main.models_dir).resolve()
     mf.set_tracking_uri(tracking_uri)  # set_tracking_uri() expects an absolute path
 
-    # If there is no active run then start one
+    # Absolute path to the directory where model and model checkpoints are be saved and loaded from
+    models_path = (repo_root / params.main.models_dir).resolve()
+
+    ''' If there is no MLFlow run currently ongoing, then start one '''
+
+    # If the script has been started from shell with `mflow run` then a run is ongoing already, no need to start it
     mf.start_run()
     mf_run = mf.active_run()
     info(f"Active run name is: {mf_run.info.run_name}")
 
-    # Set the RNG seed to make runs reproducible
-    if params.transformers.seed is not None:
-        transformers.set_seed(params.transformers.seed)
-
     # Model to be loaded; if not found, a model is optimized and then saved there
-    model_file_name = models_dir / 'saved_model'
+    fine_tuned_model_path = models_path / params.main.fine_tuned_model_dir
 
     # Check GPU is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,40 +76,21 @@ def main(params: DictConfig) -> None:
     num_labels = 6
     already_trained = False
 
-    def model_init(trial):
-        the_model = (AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(device))
-        return the_model
-
-    if Path(model_file_name).exists():
-        info(f'Loading model from directory f{model_file_name}')
-        model = (AutoModelForSequenceClassification.from_pretrained(model_file_name).to(device))
+    if Path(fine_tuned_model_path).exists():
+        info(f'Loading model from directory f{fine_tuned_model_path}')
+        model = (AutoModelForSequenceClassification.from_pretrained(fine_tuned_model_path).to(device))
         already_trained = True
     else:
-        print(f'Model f{model_file_name} not found, going to download pre-trained model for fine-tuning')
+        print(f'Model f{fine_tuned_model_path} not found, going to download pre-trained model for fine-tuning')
         model = None
         # model = (AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(device))
 
     print(model)
 
-    def compute_metrics(pred):
-        labels = pred.label_ids
-        preds = pred.predictions.argmax(-1)
-        f1 = f1_score(labels, preds, average="weighted")
-        acc = accuracy_score(labels, preds)
-        return {"accuracy": acc, "f1": f1}
-
     # logging_steps = len(emotions_encoded["train"]) // params.transformers.batch_size
     info(f'Training set contains {len(emotions_encoded["train"])} samples')
     model_name = f"{pretrained_model}-finetuned-emotion"
-    output_dir = str(models_dir / model_name)
-
-    def optuna_hp_space(trial: opt.trial.Trial) -> dict:
-        hp_space = {
-            "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True),
-            "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [16, 32, 64]),
-        }
-
-        return hp_space
+    output_dir = str(models_path / model_name)
 
     training_args = TrainingArguments(output_dir=output_dir,
                                       num_train_epochs=params.transformers.epochs,
@@ -116,6 +108,18 @@ def main(params: DictConfig) -> None:
                                       logging_first_step=True,
                                       save_strategy='epoch')
 
+    def model_init(trial: opt.trial.Trial):
+        the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(
+            device)
+        return the_model
+
+    def compute_metrics(pred):
+        ground_truth = pred.label_ids
+        preds = pred.predictions.argmax(-1)
+        f1 = f1_score(ground_truth, preds, average="weighted")
+        acc = accuracy_score(ground_truth, preds)
+        return {"accuracy": acc, "f1": f1}
+
     trainer = Trainer(model=model,
                       args=training_args,
                       compute_metrics=compute_metrics,
@@ -124,18 +128,24 @@ def main(params: DictConfig) -> None:
                       tokenizer=tokenizer,
                       model_init=model_init)
 
-    def compute_objective(metrics: dict) -> float:
-        return metrics['eval_f1']
-
     if not already_trained:
-        # training_metrics = trainer.train()
-        best_run = trainer.hyperparameter_search(hp_space=optuna_hp_space,
+        def hp_space(trial: opt.trial.Trial) -> dict:
+            res = {
+                "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True),
+                "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [16, 32, 64]),
+            }
+            return res
+
+        def compute_objective(metrics: dict) -> float:
+            return metrics['eval_f1']
+
+        best_run = trainer.hyperparameter_search(hp_space=hp_space,
                                                  n_trials=3,
                                                  direction='maximize',
                                                  compute_objective=compute_objective)
         # print(training_metrics)
         info(f'Best run: {best_run}')
-        trainer.save_model(model_file_name)
+        trainer.save_model(fine_tuned_model_path)
         already_trained = True
 
     def plot_confusion_matrix(y_preds, y_true, labels, show=True):
@@ -181,12 +191,13 @@ Add a test step -> Done
 Turn the script into an MLFlow project -> Done
 Store hyperparameters in a config. file -> Done
 Introduce proper logging -> Done
+Tune hyperparameters (using some framework/library) -> Done
+(Re-)train and save the best model after hyperparameters tuning
+Version the saved model (also the dataset?)
 Draw charts of the training and validation loss and the confusion matrix under MLFlow -> Done
 Follow Andrej recipe
 Plot charts to MLFlow for debugging of the training process, as per Andrej's lectures
 Implement early stopping
-Tune hyperparameters (using some framework/library)
-Version the model (also the dataset?)
 Give the model an API, deploy it
 Make a GUI via gradio and/or streamlit
 

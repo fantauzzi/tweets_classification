@@ -1,5 +1,6 @@
 main:
   models_dir: models #Relative to the root of the repo
+  fine_tuned_model_dir: saved_model
 mlflow:
   tracking_uri: mlruns #Relative to the root of the repo, currently only a local path is supported as uri
 transformers:
