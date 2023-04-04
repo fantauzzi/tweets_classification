@@ -1,10 +1,14 @@
 main:
   models_dir: models #Relative to the root of the repo
   fine_tuned_model_dir: saved_model
+  tuning_trials: 3
+train:
+  tune: False
+  fine_tune: True
 mlflow:
   tracking_uri: mlruns #Relative to the root of the repo, currently only a local path is supported as uri
 transformers:
   seed: 8833
   pretrained_model: 'distilbert-base-uncased'
-  epochs: 2
+  epochs: 3
   batch_size: 64
