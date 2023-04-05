@@ -12,7 +12,7 @@ from hydra.core.hydra_config import HydraConfig
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score, f1_score
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline
 
 
 def xor(a: bool, b: bool) -> bool:
@@ -25,6 +25,13 @@ def main(params: DictConfig) -> None:
     Tune the hyperparameters for best fine-tuning the model
     :param params: the configuration parameters passed by Hydra
     """
+
+    def info_active_run():
+        mf_run = mf.active_run()
+        if mf_run is None:
+            info('No MLFlow run is active')
+        else:
+            info(f"Active MLFlow run has name {mf_run.info.run_name}")
 
     ''' Set-up logging and Hydra '''
 
@@ -65,8 +72,7 @@ def main(params: DictConfig) -> None:
         info('No active MLFlow run, starting one now')
         mf.start_run()
 
-    mf_run = mf.active_run()
-    info(f"Active run name is: {mf_run.info.run_name}")
+    info_active_run()
 
     # Check GPU is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,8 +152,22 @@ def main(params: DictConfig) -> None:
             device)
         return the_model
 
+    def plot_confusion_matrix(y_preds, y_true, labels, show=True):
+        cm = confusion_matrix(y_true, y_preds, normalize="true")
+        fig, ax = plt.subplots(figsize=(6, 6))
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+        disp.plot(cmap="Blues", values_format=".2f", ax=ax, colorbar=False)
+        plt.title("Normalized confusion matrix")
+        if show:
+            plt.show()
+        return fig
+
+    labels = emotions["train"].features["label"].names
+
     if params.train.tune:
-        with mf.start_run(nested=True, description='hyperparemeters tuning') as _:
+        with mf.start_run(nested=True, description='hyperparemeters tuning'):
+            info_active_run()
+
             def hp_space(trial: opt.trial.Trial) -> dict:
                 res = {
                     "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True),
@@ -159,7 +179,8 @@ def main(params: DictConfig) -> None:
             best_trial, _ = optimize(model=None, overriding_params=None, model_init=model_init, hp_space=hp_space)
             OmegaConf.save(best_trial.hyperparameters, best_trial_path)
     if params.train.fine_tune:
-        with mf.start_run(nested=True, description='pre-trained model fine-tuning') as _:
+        with mf.start_run(nested=True, description='pre-trained model fine-tuning'):
+            info_active_run()
             best_trial_params = None
             if Path(best_trial_path).exists():
                 info(f'Loading tuned hyper-parameters from {best_trial_path}')
@@ -171,17 +192,6 @@ def main(params: DictConfig) -> None:
 
             trainer.save_model(fine_tuned_model_path)
 
-            def plot_confusion_matrix(y_preds, y_true, labels, show=True):
-                cm = confusion_matrix(y_true, y_preds, normalize="true")
-                fig, ax = plt.subplots(figsize=(6, 6))
-                disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
-                disp.plot(cmap="Blues", values_format=".2f", ax=ax, colorbar=False)
-                plt.title("Normalized confusion matrix")
-                if show:
-                    plt.show()
-                return fig
-
-            labels = emotions["train"].features["label"].names
 
             info(f'Validation set contains {len(emotions_encoded["validation"])} samples')
             preds_output_val = trainer.predict(emotions_encoded["validation"])
@@ -193,7 +203,8 @@ def main(params: DictConfig) -> None:
             fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
             mf.log_figure(fig_val, 'validation_confusion_matrix.png')
 
-        with mf.start_run(nested=True, description='fine-tuned model testing') as _:
+        with mf.start_run(nested=True, description='fine-tuned model testing'):
+            info_active_run()
             # model = AutoModelForSequenceClassification.from_pretrained(fine_tuned_model_path).to(device)
             # tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
             # pipe = pipeline(model=model, task='text-classification', tokenizer=tokenizer)
@@ -208,6 +219,21 @@ def main(params: DictConfig) -> None:
 
             fig_test = plot_confusion_matrix(y_preds_test, y_test, labels, False)
             mf.log_figure(fig_test, 'test_confusion_matrix.png')
+    if params.train.test:
+        with mf.start_run(nested=True, description='inference testing with saved model'):
+            info_active_run()
+            model = AutoModelForSequenceClassification.from_pretrained(fine_tuned_model_path)
+            tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_path)
+            pipe = pipeline(model=model, task='text-classification', tokenizer=tokenizer, device=0)
+            test_pred = pipe(emotions['test']['text'])
+            test_pred_labels = np.array([int(item['label'][-1]) for item in test_pred])
+            y_test = np.array(emotions["test"]["label"])
+            f1 = f1_score(y_test, test_pred_labels, average="weighted")
+            acc = accuracy_score(y_test, test_pred_labels)
+            info(f'Test f1 is {f1} and test accuracy is {acc}')
+
+            fig_test = plot_confusion_matrix(test_pred_labels, y_test, labels, False)
+            mf.log_figure(fig_test, 'pipeline_test_confusion_matrix.png')
 
 
 if __name__ == '__main__':
@@ -220,6 +246,7 @@ Store hyperparameters in a config.file -> Done
 Introduce proper logging -> Done
 Tune hyperparameters(using some framework / library) -> Done
 (Re -)train and save -> Done
+Do proper testing of inference from saved model
 Version the saved model(also the dataset?)
 Draw charts of the training and validation loss and the confusion matrix under MLFlow -> Done
 Follow Andrej recipe
