@@ -1,9 +1,9 @@
 main:
   models_dir: models #Relative to the root of the repo
   fine_tuned_model_dir: saved_model
-  tuning_trials: 3
+  tuning_trials: 4
 train:
-  tune: False
+  tune: True
   fine_tune: True
   test: True
 mlflow:
@@ -11,5 +11,6 @@ mlflow:
 transformers:
   seed: 8833
   pretrained_model: 'distilbert-base-uncased'
-  epochs: 2
+  epochs: 6
   batch_size: 64
+  early_stopping_patience: 1

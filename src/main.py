@@ -13,6 +13,7 @@ from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score, f1_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline
+from transformers.models.distilbert.modeling_distilbert import DistilBertForSequenceClassification
 
 
 def xor(a: bool, b: bool) -> bool:
@@ -27,6 +28,9 @@ def main(params: DictConfig) -> None:
     """
 
     def info_active_run():
+        """
+        Logs an info message with the indication of the currently active MLFlow run, or that there is no active run.
+        """
         mf_run = mf.active_run()
         if mf_run is None:
             info('No MLFlow run is active')
@@ -45,7 +49,7 @@ def main(params: DictConfig) -> None:
 
     ''' Set the RNG seed to make runs reproducible '''
 
-    if params.transformers.seed is not None:
+    if params.transformers.get('seed') is not None:
         transformers.set_seed(params.transformers.seed)
 
     ''' Set various path '''
@@ -57,24 +61,28 @@ def main(params: DictConfig) -> None:
     tracking_uri = repo_root / params.mlflow.tracking_uri
     mf.set_tracking_uri(tracking_uri)  # set_tracking_uri() expects an absolute path
 
-    # Absolute path to the directory where model and model checkpoints are be saved and loaded from
+    # Absolute path to the directory where model and model checkpoints are to be saved and loaded from
     models_path = (repo_root / params.main.models_dir).resolve()
 
-    # Model to be loaded; if not found, a model is optimized and then saved there
+    # Absolute path the fine-tuned model are saved to/loaded from
     fine_tuned_model_path = models_path / params.main.fine_tuned_model_dir
 
+    # Absolute path where the hyperparameter values for the fine-tuned model are saved to/loaded from
     best_trial_path = models_path / 'best_trial.yaml'
 
-    ''' If there is no MLFlow run currently ongoing, then start one '''
+    ''' If there is no MLFlow run currently ongoing, then start one. Note that is this script has been started from
+     shell with `mlflow run` then a run is ongoing already, no need to start it'''
 
-    # If the script has been started from shell with `mflow run` then a run is ongoing already, no need to start it
     if mf.active_run() is None:
         info('No active MLFlow run, starting one now')
         mf.start_run()
 
     info_active_run()
 
-    # Check GPU is available
+    if not models_path.exists():
+        models_path.mkdir()
+
+    # Check if GPU is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != 'cuda':
         warning(f'No GPU found, device type is {device.type}')
@@ -94,14 +102,15 @@ def main(params: DictConfig) -> None:
     model_name = f"{pretrained_model}-finetuned-emotion"
     output_dir = str(models_path / model_name)
 
-    def compute_metrics(pred):
+    def compute_metrics(pred: transformers.trainer_utils.EvalPrediction) -> dict[str, np.float64]:
         ground_truth = pred.label_ids
         preds = pred.predictions.argmax(-1)
         f1 = f1_score(ground_truth, preds, average="weighted")
         acc = accuracy_score(ground_truth, preds)
         return {"accuracy": acc, "f1": f1}
 
-    def optimize(model, overriding_params=None, model_init=None, hp_space=None):
+    def optimize(model, early_stopping_patience, overriding_params=None, model_init=None, hp_space=None):
+        # TODO use model_init to initialize the model every time, and stop passing the model in param. model
         assert xor(model is not None, model_init is not None or hp_space is not None)
 
         training_args = TrainingArguments(output_dir=output_dir,
@@ -117,11 +126,28 @@ def main(params: DictConfig) -> None:
                                           logging_strategy='epoch',
                                           report_to=['mlflow'],
                                           logging_first_step=True,
-                                          save_strategy='epoch')
+                                          save_strategy='epoch',
+                                          load_best_model_at_end=True)
 
         if overriding_params is not None:
             for key, value in overriding_params.items():
                 setattr(training_args, key, value)
+
+        class MyCallback(transformers.TrainerCallback):
+            "A callback that starts and stop an MLFlow nested run at the beginning and end of training"
+
+            def on_train_begin(self, args, state, control, **kwargs):
+                mf.start_run(nested=True, description='hyperparemeters tuning trial')
+                info_active_run()
+
+            def on_train_end(self,
+                             args: TrainingArguments,
+                             state: transformers.TrainerState,
+                             control: transformers.TrainerControl,
+                             **kwargs):
+                mf.end_run()
+
+        callbacks = [transformers.EarlyStoppingCallback(early_stopping_patience=early_stopping_patience), MyCallback]
 
         trainer = Trainer(model=model,
                           args=training_args,
@@ -129,7 +155,8 @@ def main(params: DictConfig) -> None:
                           train_dataset=emotions_encoded["train"],
                           eval_dataset=emotions_encoded["validation"],
                           tokenizer=tokenizer,
-                          model_init=model_init)
+                          model_init=model_init,
+                          callbacks=callbacks)
 
         def compute_objective(metrics: dict) -> float:
             return metrics['eval_f1']
@@ -139,7 +166,6 @@ def main(params: DictConfig) -> None:
                                                 n_trials=params.main.tuning_trials,
                                                 direction='maximize',
                                                 compute_objective=compute_objective)
-            # print(training_metrics)
             info(f'Best run: {res}')
         else:
             res = trainer.train()
@@ -147,7 +173,13 @@ def main(params: DictConfig) -> None:
 
         return res, trainer
 
-    def model_init(trial: opt.trial.Trial | None = None):
+    def get_model(trial: opt.trial.Trial | None = None) -> DistilBertForSequenceClassification:
+        """
+        Returns the model. The signature of the function is such that it can be invoked by Optuna during
+        hyperparameters tuning.
+        :param trial: an Optuna Trial object, or None.
+        :return: the model instance. It is already in the GPU memory if a GPU is available.
+        """
         the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(
             device)
         return the_model
@@ -164,6 +196,8 @@ def main(params: DictConfig) -> None:
 
     labels = emotions["train"].features["label"].names
 
+    ''' Find the best value for hyperparameters that govern the model's fine-tuning, if requested '''
+
     if params.train.tune:
         with mf.start_run(nested=True, description='hyperparemeters tuning'):
             info_active_run()
@@ -176,8 +210,16 @@ def main(params: DictConfig) -> None:
                 }
                 return res
 
-            best_trial, _ = optimize(model=None, overriding_params=None, model_init=model_init, hp_space=hp_space)
+            best_trial, _ = optimize(model=None,
+                                     early_stopping_patience=params.transformers.early_stopping_patience,
+                                     overriding_params=None,
+                                     model_init=get_model,
+                                     hp_space=hp_space)
             OmegaConf.save(best_trial.hyperparameters, best_trial_path)
+
+    ''' Fine-tune the model if requested. Default hyperparameter values are taken from the config/params.yaml file, but 
+    are then overridden by values taken from the models/saved_models/best_trial.yaml file if such file exists '''
+
     if params.train.fine_tune:
         with mf.start_run(nested=True, description='pre-trained model fine-tuning'):
             info_active_run()
@@ -185,14 +227,18 @@ def main(params: DictConfig) -> None:
             if Path(best_trial_path).exists():
                 info(f'Loading tuned hyper-parameters from {best_trial_path}')
                 best_trial_params = dict(OmegaConf.load(best_trial_path))
-            # info(f'Loading model from directory f{fine_tuned_model_path}')
-            model = model_init()
+            model = get_model()
 
-            training_metrics, trainer = optimize(model=model, overriding_params=best_trial_params)
+            training_metrics, trainer = optimize(model=model,
+                                                 early_stopping_patience=params.transformers.early_stopping_patience,
+                                                 overriding_params=best_trial_params)
 
             trainer.save_model(fine_tuned_model_path)
 
+        ''' Validate the model that has just been fine-tuned'''
 
+        with mf.start_run(nested=True, description='fine-tuned model validation'):
+            info_active_run()
             info(f'Validation set contains {len(emotions_encoded["validation"])} samples')
             preds_output_val = trainer.predict(emotions_encoded["validation"])
             info(f'Validation metrics\n{preds_output_val.metrics}')
@@ -203,14 +249,12 @@ def main(params: DictConfig) -> None:
             fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
             mf.log_figure(fig_val, 'validation_confusion_matrix.png')
 
+        ''' Test the model that has just been fine-tuned'''
+
         with mf.start_run(nested=True, description='fine-tuned model testing'):
             info_active_run()
-            # model = AutoModelForSequenceClassification.from_pretrained(fine_tuned_model_path).to(device)
-            # tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
-            # pipe = pipeline(model=model, task='text-classification', tokenizer=tokenizer)
             info(f'Test set contains {len(emotions_encoded["test"])} samples')
             preds_output_test = trainer.predict(emotions_encoded["test"])
-            # preds_output_test = pipe(emotions_encoded["test"])
             info(f'Test metrics\n{preds_output_test.metrics}')
             mf.log_metrics(preds_output_test.metrics)
 
@@ -219,6 +263,9 @@ def main(params: DictConfig) -> None:
 
             fig_test = plot_confusion_matrix(y_preds_test, y_test, labels, False)
             mf.log_figure(fig_test, 'test_confusion_matrix.png')
+
+    ''' Test the saved fine-tuned model if required. That is the same model that would be used for inference '''
+
     if params.train.test:
         with mf.start_run(nested=True, description='inference testing with saved model'):
             info_active_run()
@@ -231,6 +278,7 @@ def main(params: DictConfig) -> None:
             f1 = f1_score(y_test, test_pred_labels, average="weighted")
             acc = accuracy_score(y_test, test_pred_labels)
             info(f'Test f1 is {f1} and test accuracy is {acc}')
+            # TODO log these metrics with MLFlow ---^
 
             fig_test = plot_confusion_matrix(test_pred_labels, y_test, labels, False)
             mf.log_figure(fig_test, 'pipeline_test_confusion_matrix.png')
@@ -246,14 +294,18 @@ Store hyperparameters in a config.file -> Done
 Introduce proper logging -> Done
 Tune hyperparameters(using some framework / library) -> Done
 (Re -)train and save -> Done
-Do proper testing of inference from saved model
-Version the saved model(also the dataset?)
+Do proper testing of inference from saved model -> Done
 Draw charts of the training and validation loss and the confusion matrix under MLFlow -> Done
+Implement early-stopping -> Done
+Make a nested run for every Optuna trial -> Done
+
+Make sure hyperparameters search works correctly
+
+Make a GUI via gradio and / or streamlit
+Version the saved model(also the dataset?)
 Follow Andrej recipe
 Plot charts to MLFlow for debugging of the training process, as per Andrej's lectures
-Implement early stopping
 Give the model an API, deploy it
-Make a GUI via gradio and / or streamlit
 Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
     computed again later
 """
