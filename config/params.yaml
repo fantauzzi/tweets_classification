@@ -3,7 +3,7 @@ main:
   fine_tuned_model_dir: saved_model
   tuning_trials: 4
 train:
-  tune: True
+  tune: False
   fine_tune: True
   test: True
 mlflow:
@@ -11,6 +11,6 @@ mlflow:
 transformers:
   seed: 8833
   pretrained_model: 'distilbert-base-uncased'
-  epochs: 6
-  batch_size: 64
-  early_stopping_patience: 1
+  epochs: 12
+  batch_size: 256
+  early_stopping_patience: 2

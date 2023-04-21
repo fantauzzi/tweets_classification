@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+import random
 
 import hydra
 import mlflow as mf
@@ -51,6 +52,8 @@ def main(params: DictConfig) -> None:
 
     if params.transformers.get('seed') is not None:
         transformers.set_seed(params.transformers.seed)
+        # MLFlow uses the random package to draw random run names, this below ensures the names are actually random
+        random.seed()
 
     ''' Set various path '''
 
@@ -133,10 +136,15 @@ def main(params: DictConfig) -> None:
             for key, value in overriding_params.items():
                 setattr(training_args, key, value)
 
-        class MyCallback(transformers.TrainerCallback):
-            "A callback that starts and stop an MLFlow nested run at the beginning and end of training"
+        class MLFlowTrialCB(transformers.TrainerCallback):
+            """ A callback that starts and stops an MLFlow nested run at the beginning and end of training, meant to
+            encompass one Optuna trial for hyperparameters tuning """
 
-            def on_train_begin(self, args, state, control, **kwargs):
+            def on_train_begin(self,
+                               args: TrainingArguments,
+                               state: transformers.TrainerState,
+                               control: transformers.TrainerControl,
+                               **kwargs):
                 mf.start_run(nested=True, description='hyperparemeters tuning trial')
                 info_active_run()
 
@@ -147,7 +155,9 @@ def main(params: DictConfig) -> None:
                              **kwargs):
                 mf.end_run()
 
-        callbacks = [transformers.EarlyStoppingCallback(early_stopping_patience=early_stopping_patience), MyCallback]
+        callbacks = [transformers.EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
+        if model_init is not None:
+            callbacks.append(MLFlowTrialCB())
 
         trainer = Trainer(model=model,
                           args=training_args,
@@ -299,6 +309,7 @@ Draw charts of the training and validation loss and the confusion matrix under M
 Implement early-stopping -> Done
 Make a nested run for every Optuna trial -> Done
 
+Send the training to the cloud
 Make sure hyperparameters search works correctly
 
 Make a GUI via gradio and / or streamlit
