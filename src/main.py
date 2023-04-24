@@ -1,8 +1,10 @@
 import logging
 from pathlib import Path
 import random
+import os
 
 import hydra
+import mlflow
 import mlflow as mf
 import numpy as np
 import optuna as opt
@@ -36,7 +38,7 @@ def main(params: DictConfig) -> None:
         if mf_run is None:
             info('No MLFlow run is active')
         else:
-            info(f"Active MLFlow run has name {mf_run.info.run_name}")
+            info(f"Active MLFlow run has name {mf_run.info.run_name} and ID {mf_run.info.run_id}")
 
     ''' Set-up logging and Hydra '''
 
@@ -53,7 +55,8 @@ def main(params: DictConfig) -> None:
     if params.transformers.get('seed') is not None:
         transformers.set_seed(params.transformers.seed)
         # MLFlow uses the random package to draw random run names, this below ensures the names are actually random
-        random.seed()
+        # TODO handle this properly
+        # random.seed()
 
     ''' Set various path '''
 
@@ -89,6 +92,14 @@ def main(params: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != 'cuda':
         warning(f'No GPU found, device type is {device.type}')
+
+    # Save the output of nvidia-smi (GPU info) into a text file, log it with MLFlow then delete the file
+    nvidia_info_filename = 'nvidia-smi.txt'
+    nvidia_info_path = repo_root = repo_root / nvidia_info_filename
+    os.system(f'nvidia-smi -q > {nvidia_info_path}')
+    mf.log_artifact(str(nvidia_info_path))
+    nvidia_info_path.unlink(missing_ok=True)
+
 
     emotions = load_dataset('emotion')
     pretrained_model = params.transformers.pretrained_model
@@ -216,7 +227,7 @@ def main(params: DictConfig) -> None:
                 res = {
                     "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True),
                     "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size",
-                                                                             [16, 32, 64]),
+                                                                             [64, 128, 192, 256]),
                 }
                 return res
 
@@ -257,7 +268,7 @@ def main(params: DictConfig) -> None:
             y_valid = np.array(emotions_encoded["validation"]["label"])
 
             fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
-            mf.log_figure(fig_val, 'validation_confusion_matrix.png')
+            mf.log_figure(fig_val, 'validation_confusion_matrix.png')  # PermissionError: [Errno 13] Permission denied: '/home/fanta'
 
         ''' Test the model that has just been fine-tuned'''
 
@@ -308,8 +319,14 @@ Do proper testing of inference from saved model -> Done
 Draw charts of the training and validation loss and the confusion matrix under MLFlow -> Done
 Implement early-stopping -> Done
 Make a nested run for every Optuna trial -> Done
+Send the training to the cloud -> Done
+Make sure GPU info is logged -> Done
 
-Send the training to the cloud
+Check reproducibility
+Ensure parameters for every trial are logged, at least the changing ones
+What parameter values are logged for the overall fine-tuning run? Is it the parameters of the best model so far?
+Log computation times
+Try GPU on Amazon/google free service
 Make sure hyperparameters search works correctly
 
 Make a GUI via gradio and / or streamlit
