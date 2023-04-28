@@ -1,10 +1,9 @@
+import json
 import logging
-from pathlib import Path
-import random
 import os
+from pathlib import Path
 
 import hydra
-import mlflow
 import mlflow as mf
 import numpy as np
 import optuna as opt
@@ -16,7 +15,9 @@ from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score, f1_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline
+from transformers.integrations import MLflowCallback
 from transformers.models.distilbert.modeling_distilbert import DistilBertForSequenceClassification
+from transformers.utils import flatten_dict
 
 
 def xor(a: bool, b: bool) -> bool:
@@ -100,7 +101,6 @@ def main(params: DictConfig) -> None:
     mf.log_artifact(str(nvidia_info_path))
     nvidia_info_path.unlink(missing_ok=True)
 
-
     emotions = load_dataset('emotion')
     pretrained_model = params.transformers.pretrained_model
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
@@ -147,28 +147,71 @@ def main(params: DictConfig) -> None:
             for key, value in overriding_params.items():
                 setattr(training_args, key, value)
 
-        class MLFlowTrialCB(transformers.TrainerCallback):
+        # class MLFlowTrialCB(transformers.TrainerCallback):
+        class MLFlowTrialCB(MLflowCallback):
             """ A callback that starts and stops an MLFlow nested run at the beginning and end of training, meant to
             encompass one Optuna trial for hyperparameters tuning """
+
+            def __init__(self):
+                super().__init__()
+                self._nested_run_id = None
+
+            def log_params_with_mlflow(self, model, args, state):
+                assert self._initialized
+                if not state.is_world_process_zero:
+                    return
+                combined_dict = args.to_dict()
+                if hasattr(model, "config") and model.config is not None:
+                    model_config = model.config.to_dict()
+                    combined_dict = {**model_config, **combined_dict}
+                combined_dict = flatten_dict(combined_dict) if self._flatten_params else combined_dict
+
+                # remove params that are too long for MLflow
+                for name, value in list(combined_dict.items()):
+                    # internally, all values are converted to str in MLflow
+                    if len(str(value)) > self._MAX_PARAM_VAL_LENGTH:
+                        logger.warning(
+                            f'Trainer is attempting to log a value of "{value}" for key "{name}" as a parameter. MLflow\'s'
+                            " log_param() only accepts values no longer than 250 characters so we dropped this attribute."
+                            " You can use `MLFLOW_FLATTEN_PARAMS` environment variable to flatten the parameters and"
+                            " avoid this message."
+                        )
+                        del combined_dict[name]
+                # MLflow cannot log more than 100 values in one go, so we have to split it
+                combined_dict_items = list(combined_dict.items())
+                for i in range(0, len(combined_dict_items), self._MAX_PARAMS_TAGS_PER_BATCH):
+                    self._ml_flow.log_params(dict(combined_dict_items[i: i + self._MAX_PARAMS_TAGS_PER_BATCH]))
+                mlflow_tags = os.getenv("MLFLOW_TAGS", None)
+                if mlflow_tags:
+                    mlflow_tags = json.loads(mlflow_tags)
+                    self._ml_flow.set_tags(mlflow_tags)
 
             def on_train_begin(self,
                                args: TrainingArguments,
                                state: transformers.TrainerState,
                                control: transformers.TrainerControl,
                                **kwargs):
-                mf.start_run(nested=True, description='hyperparemeters tuning trial')
+                super().on_train_begin(args=args, state=state, control=control, **kwargs)
+                run = mf.start_run(nested=True, description='hyperparemeters tuning trial')
                 info_active_run()
+                assert self._nested_run_id is None
+                self._nested_run_id = run.info.run_id
+                self.log_params_with_mlflow(model=model, args=args, state=state)
 
             def on_train_end(self,
                              args: TrainingArguments,
                              state: transformers.TrainerState,
                              control: transformers.TrainerControl,
                              **kwargs):
+                super().on_train_end(args=args, state=state, control=control, **kwargs)
+                run = mf.active_run()
+                assert run.info.run_id == self._nested_run_id
                 mf.end_run()
+                self._nested_run_id = None
 
         callbacks = [transformers.EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
-        if model_init is not None:
-            callbacks.append(MLFlowTrialCB())
+        """if model_init is not None:
+            callbacks.append(MLFlowTrialCB())"""
 
         trainer = Trainer(model=model,
                           args=training_args,
@@ -178,6 +221,10 @@ def main(params: DictConfig) -> None:
                           tokenizer=tokenizer,
                           model_init=model_init,
                           callbacks=callbacks)
+
+        if model_init is not None:  # TODO Yuck!
+            trainer.remove_callback(MLflowCallback)
+            trainer.add_callback(MLFlowTrialCB())
 
         def compute_objective(metrics: dict) -> float:
             return metrics['eval_f1']
@@ -268,7 +315,8 @@ def main(params: DictConfig) -> None:
             y_valid = np.array(emotions_encoded["validation"]["label"])
 
             fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
-            mf.log_figure(fig_val, 'validation_confusion_matrix.png')  # PermissionError: [Errno 13] Permission denied: '/home/fanta'
+            mf.log_figure(fig_val,
+                          'validation_confusion_matrix.png')  # PermissionError: [Errno 13] Permission denied: '/home/fanta'
 
         ''' Test the model that has just been fine-tuned'''
 
@@ -321,9 +369,12 @@ Implement early-stopping -> Done
 Make a nested run for every Optuna trial -> Done
 Send the training to the cloud -> Done
 Make sure GPU info is logged -> Done
+Ensure parameters for every trial are logged, at least the changing ones -> Done
 
+Split MLFlowTrialCB() in its own file and document it 
 Check reproducibility
-Ensure parameters for every trial are logged, at least the changing ones
+Can fine-tuning be interrupted and resumed?
+Have actually random run names even with a set random seed
 What parameter values are logged for the overall fine-tuning run? Is it the parameters of the best model so far?
 Log computation times
 Try GPU on Amazon/google free service
