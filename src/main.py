@@ -293,15 +293,15 @@ Split MLFlowTrialCB() in its own file -> Done
 Try GPU on Amazon/google free service -> Done
 Have actually random run names even with a set random seed -> Done
 Fix reproducibility -> Done
+Make sure hyperparameters search works correctly -> Done
 
 Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
     computed again later
 Can fine-tuning be interrupted and resumed?
 Log computation times
-Make sure hyperparameters search works correctly
 Make a GUI via gradio and / or streamlit
 Version the saved model(also the dataset?)
 Follow Andrej recipe
 Plot charts to MLFlow for debugging of the training process, as per Andrej's lectures
-Give the model an API, deploy it
+Give the model an API, deploy it, unit-test it
 """
