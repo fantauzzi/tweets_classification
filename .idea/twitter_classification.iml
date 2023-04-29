@@ -9,7 +9,7 @@
       <excludeFolder url="file://$MODULE_DIR$/src/outputs" />
       <excludeFolder url="file://$MODULE_DIR$/models" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.10 (python3.10.7) (6)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.11.3 (tweets_classification)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>
