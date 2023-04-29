@@ -1,7 +1,7 @@
 main:
   models_dir: models #Relative to the root of the repo
   fine_tuned_model_dir: saved_model
-  tuning_trials: 4
+  tuning_trials: 3
 train:
   tune: True
   fine_tune: True

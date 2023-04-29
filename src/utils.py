@@ -1,14 +1,16 @@
 import json
 import logging
 import os
+import random
 
 import mlflow as mf
+import numpy as np
 import transformers
+from mlflow.utils.name_utils import _generate_random_name
+from sklearn.metrics import accuracy_score, f1_score
 from transformers import TrainingArguments
 from transformers.integrations import MLflowCallback
 from transformers.utils import flatten_dict
-from sklearn.metrics import accuracy_score, f1_score
-import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
 _logger = logging.getLogger()
@@ -75,7 +77,7 @@ class MLFlowTrialCB(MLflowCallback):
                        control: transformers.TrainerControl,
                        **kwargs):
         super().on_train_begin(args=args, state=state, control=control, **kwargs)
-        run = mf.start_run(nested=True, description='hyperparemeters tuning trial')
+        run = mf.start_run(run_name=get_name_for_run(), nested=True, description='hyperparemeters tuning trial')
         info_active_run()
         assert self._nested_run_id is None
         self._nested_run_id = run.info.run_id
@@ -92,9 +94,25 @@ class MLFlowTrialCB(MLflowCallback):
         mf.end_run()
         self._nested_run_id = None
 
+
 def compute_metrics(pred: transformers.trainer_utils.EvalPrediction) -> dict[str, np.float64]:
     ground_truth = pred.label_ids
     preds = pred.predictions.argmax(-1)
     f1 = f1_score(ground_truth, preds, average="weighted")
     acc = accuracy_score(ground_truth, preds)
     return {"accuracy": acc, "f1": f1}
+
+
+def get_name_for_run() -> str:
+    """
+    Returns a random string suitable as the name for an MLFlow run. The returned string remains random even if the
+    RNG seed has been set with random.seed(). The state of the RNG in module `random` when the function returns is the
+    same as when the function was called. This allows to set a seed for the RNG (for other purposes) while still getting
+    random (unpredictable) strings to be used as probably unique run names.
+    :return:
+    """
+    curr_state = random.getstate()
+    random.seed()
+    name_for_run = _generate_random_name()
+    random.setstate(curr_state)
+    return name_for_run

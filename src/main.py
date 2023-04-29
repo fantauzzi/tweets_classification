@@ -11,12 +11,13 @@ from datasets import load_dataset
 from hydra.core.hydra_config import HydraConfig
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
+from optuna.samplers import TPESampler
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score, f1_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline
 from transformers.integrations import MLflowCallback
 from transformers.models.distilbert.modeling_distilbert import DistilBertForSequenceClassification
 
-from utils import info, warning, info_active_run, MLFlowTrialCB, xor, compute_metrics
+from utils import info, warning, info_active_run, MLFlowTrialCB, xor, compute_metrics, get_name_for_run
 
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
@@ -33,7 +34,8 @@ def main(params: DictConfig) -> None:
 
     ''' Set the RNG seed to make runs reproducible '''
 
-    if params.transformers.get('seed') is not None:
+    seed = params.transformers.get('seed')
+    if seed is not None:
         transformers.set_seed(params.transformers.seed)
         # MLFlow uses the random package to draw random run names, this below ensures the names are actually random
         # TODO handle this properly
@@ -62,7 +64,7 @@ def main(params: DictConfig) -> None:
 
     if mf.active_run() is None:
         info('No active MLFlow run, starting one now')
-        mf.start_run()
+        mf.start_run(run_name=get_name_for_run())
 
     info_active_run()
 
@@ -96,8 +98,12 @@ def main(params: DictConfig) -> None:
     model_name = f"{pretrained_model}-finetuned-emotion"
     output_dir = str(models_path / model_name)
 
-
-    def optimize(model, early_stopping_patience, overriding_params=None, model_init=None, hp_space=None):
+    def optimize(model,
+                 early_stopping_patience,
+                 overriding_params=None,
+                 model_init=None,
+                 hp_space=None,
+                 optuna_sampler=None):
         # TODO use model_init to initialize the model every time, and stop passing the model in param. model
         assert xor(model is not None, model_init is not None or hp_space is not None)
 
@@ -122,8 +128,6 @@ def main(params: DictConfig) -> None:
                 setattr(training_args, key, value)
 
         callbacks = [transformers.EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
-        """if model_init is not None:
-            callbacks.append(MLFlowTrialCB())"""
 
         trainer = Trainer(model=model,
                           args=training_args,
@@ -134,7 +138,7 @@ def main(params: DictConfig) -> None:
                           model_init=model_init,
                           callbacks=callbacks)
 
-        if model_init is not None:  # TODO Yuck!
+        if model_init is not None:
             trainer.remove_callback(MLflowCallback)
             trainer.add_callback(MLFlowTrialCB())
 
@@ -145,7 +149,8 @@ def main(params: DictConfig) -> None:
             res = trainer.hyperparameter_search(hp_space=hp_space,
                                                 n_trials=params.main.tuning_trials,
                                                 direction='maximize',
-                                                compute_objective=compute_objective)
+                                                compute_objective=compute_objective,
+                                                sampler=optuna_sampler)
             info(f'Best run: {res}')
         else:
             res = trainer.train()
@@ -179,7 +184,7 @@ def main(params: DictConfig) -> None:
     ''' Find the best value for hyperparameters that govern the model's fine-tuning, if requested '''
 
     if params.train.tune:
-        with mf.start_run(nested=True, description='hyperparemeters tuning'):
+        with mf.start_run(run_name=get_name_for_run(), nested=True, description='hyperparemeters tuning'):
             info_active_run()
 
             def hp_space(trial: opt.trial.Trial) -> dict:
@@ -190,18 +195,20 @@ def main(params: DictConfig) -> None:
                 }
                 return res
 
+            optuna_sampler = None if seed is None else TPESampler(seed=seed)
             best_trial, _ = optimize(model=None,
                                      early_stopping_patience=params.transformers.early_stopping_patience,
                                      overriding_params=None,
                                      model_init=get_model,
-                                     hp_space=hp_space)
+                                     hp_space=hp_space,
+                                     optuna_sampler=optuna_sampler)
             OmegaConf.save(best_trial.hyperparameters, best_trial_path)
 
     ''' Fine-tune the model if requested. Default hyperparameter values are taken from the config/params.yaml file, but 
     are then overridden by values taken from the models/saved_models/best_trial.yaml file if such file exists '''
 
     if params.train.fine_tune:
-        with mf.start_run(nested=True, description='pre-trained model fine-tuning'):
+        with mf.start_run(run_name=get_name_for_run(), nested=True, description='pre-trained model fine-tuning'):
             info_active_run()
             best_trial_params = None
             if Path(best_trial_path).exists():
@@ -217,7 +224,7 @@ def main(params: DictConfig) -> None:
 
         ''' Validate the model that has just been fine-tuned'''
 
-        with mf.start_run(nested=True, description='fine-tuned model validation'):
+        with mf.start_run(run_name=get_name_for_run(), nested=True, description='fine-tuned model validation'):
             info_active_run()
             info(f'Validation set contains {len(emotions_encoded["validation"])} samples')
             preds_output_val = trainer.predict(emotions_encoded["validation"])
@@ -232,7 +239,7 @@ def main(params: DictConfig) -> None:
 
         ''' Test the model that has just been fine-tuned'''
 
-        with mf.start_run(nested=True, description='fine-tuned model testing'):
+        with mf.start_run(run_name=get_name_for_run(), nested=True, description='fine-tuned model testing'):
             info_active_run()
             info(f'Test set contains {len(emotions_encoded["test"])} samples')
             preds_output_test = trainer.predict(emotions_encoded["test"])
@@ -248,7 +255,7 @@ def main(params: DictConfig) -> None:
     ''' Test the saved fine-tuned model if required. That is the same model that would be used for inference '''
 
     if params.train.test:
-        with mf.start_run(nested=True, description='inference testing with saved model'):
+        with mf.start_run(run_name=get_name_for_run(), nested=True, description='inference testing with saved model'):
             info_active_run()
             model = AutoModelForSequenceClassification.from_pretrained(fine_tuned_model_path)
             tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_path)
@@ -282,21 +289,19 @@ Make a nested run for every Optuna trial -> Done
 Send the training to the cloud -> Done
 Make sure GPU info is logged -> Done
 Ensure parameters for every trial are logged, at least the changing ones -> Done
+Split MLFlowTrialCB() in its own file -> Done
+Try GPU on Amazon/google free service -> Done
+Have actually random run names even with a set random seed -> Done
+Fix reproducibility -> Done
 
-Split MLFlowTrialCB() in its own file and document it 
-Check reproducibility
+Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
+    computed again later
 Can fine-tuning be interrupted and resumed?
-Have actually random run names even with a set random seed
-What parameter values are logged for the overall fine-tuning run? Is it the parameters of the best model so far?
 Log computation times
-Try GPU on Amazon/google free service
 Make sure hyperparameters search works correctly
-
 Make a GUI via gradio and / or streamlit
 Version the saved model(also the dataset?)
 Follow Andrej recipe
 Plot charts to MLFlow for debugging of the training process, as per Andrej's lectures
 Give the model an API, deploy it
-Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
-    computed again later
 """
