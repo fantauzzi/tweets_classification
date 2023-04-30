@@ -16,8 +16,8 @@ from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_s
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline
 from transformers.integrations import MLflowCallback
 from transformers.models.distilbert.modeling_distilbert import DistilBertForSequenceClassification
-
 from utils import info, warning, info_active_run, MLFlowTrialCB, xor, compute_metrics, get_name_for_run
+from optuna.pruners import NopPruner
 
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
@@ -146,11 +146,17 @@ def main(params: DictConfig) -> None:
             return metrics['eval_f1']
 
         if model_init is not None:
+            study_name = params.fine_tuning.study_name
+            trials_storage = f'sqlite:///../db/{study_name}.db'
             res = trainer.hyperparameter_search(hp_space=hp_space,
-                                                n_trials=params.main.tuning_trials,
+                                                n_trials=params.fine_tuning.n_trials,
                                                 direction='maximize',
                                                 compute_objective=compute_objective,
-                                                sampler=optuna_sampler)
+                                                sampler=optuna_sampler,
+                                                study_name=study_name,
+                                                storage=trials_storage,
+                                                load_if_exists=params.fine_tuning.resume_previous,
+                                                pruner=NopPruner())
             info(f'Best run: {res}')
         else:
             res = trainer.train()
@@ -294,10 +300,12 @@ Try GPU on Amazon/google free service -> Done
 Have actually random run names even with a set random seed -> Done
 Fix reproducibility -> Done
 Make sure hyperparameters search works correctly -> Done
+Can fine-tuning be interrupted and resumed? -> Done, yes!
 
+Log with MLFlow the Optuna trial id of every nested run, also make sure the study name is logged
+Tag the best nested run as such, will have to remove and re-assign the tag of best nested run as needed 
 Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
-    computed again later
-Can fine-tuning be interrupted and resumed?
+    computed again later (is it even possible?)
 Log computation times
 Make a GUI via gradio and / or streamlit
 Version the saved model(also the dataset?)

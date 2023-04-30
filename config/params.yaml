@@ -1,11 +1,14 @@
 main:
   models_dir: models #Relative to the root of the repo
   fine_tuned_model_dir: saved_model
-  tuning_trials: 3
 train:
   tune: True
   fine_tune: True
   test: True
+fine_tuning:
+  study_name: trials
+  resume_previous: yes
+  n_trials: 10
 mlflow:
   tracking_uri: mlruns #Relative to the root of the repo, currently only a local path is supported as uri
 transformers:
