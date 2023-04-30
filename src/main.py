@@ -11,13 +11,14 @@ from datasets import load_dataset
 from hydra.core.hydra_config import HydraConfig
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
+from optuna.pruners import NopPruner
 from optuna.samplers import TPESampler
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score, f1_score
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline, \
+    DistilBertForSequenceClassification
 from transformers.integrations import MLflowCallback
-from transformers.models.distilbert.modeling_distilbert import DistilBertForSequenceClassification
-from utils import info, warning, info_active_run, MLFlowTrialCB, xor, compute_metrics, get_name_for_run
-from optuna.pruners import NopPruner
+
+from utils import info, warning, info_active_run, MLFlowTrialCB, compute_metrics, get_name_for_run
 
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
@@ -98,14 +99,12 @@ def main(params: DictConfig) -> None:
     model_name = f"{pretrained_model}-finetuned-emotion"
     output_dir = str(models_path / model_name)
 
-    def optimize(model,
+    def optimize(model_init,
                  early_stopping_patience,
                  overriding_params=None,
-                 model_init=None,
                  hp_space=None,
                  optuna_sampler=None):
-        # TODO use model_init to initialize the model every time, and stop passing the model in param. model
-        assert xor(model is not None, model_init is not None or hp_space is not None)
+        assert (hp_space is None and optuna_sampler is None) or (hp_space is not None and optuna_sampler is not None)
 
         training_args = TrainingArguments(output_dir=output_dir,
                                           num_train_epochs=params.transformers.epochs,
@@ -129,23 +128,21 @@ def main(params: DictConfig) -> None:
 
         callbacks = [transformers.EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
 
-        trainer = Trainer(model=model,
+        trainer = Trainer(model=model_init() if hp_space is None else None,
                           args=training_args,
                           compute_metrics=compute_metrics,
                           train_dataset=emotions_encoded["train"],
                           eval_dataset=emotions_encoded["validation"],
                           tokenizer=tokenizer,
-                          model_init=model_init,
+                          model_init=model_init if hp_space is not None else None,
                           callbacks=callbacks)
 
-        if model_init is not None:
+        if hp_space is not None:
+            def compute_objective(metrics: dict) -> float:
+                return metrics['eval_f1']
+
             trainer.remove_callback(MLflowCallback)
             trainer.add_callback(MLFlowTrialCB())
-
-        def compute_objective(metrics: dict) -> float:
-            return metrics['eval_f1']
-
-        if model_init is not None:
             study_name = params.fine_tuning.study_name
             trials_storage = f'sqlite:///../db/{study_name}.db'
             res = trainer.hyperparameter_search(hp_space=hp_space,
@@ -164,17 +161,6 @@ def main(params: DictConfig) -> None:
 
         return res, trainer
 
-    def get_model(trial: opt.trial.Trial | None = None) -> DistilBertForSequenceClassification:
-        """
-        Returns the model. The signature of the function is such that it can be invoked by Optuna during
-        hyperparameters tuning.
-        :param trial: an Optuna Trial object, or None.
-        :return: the model instance. It is already in the GPU memory if a GPU is available.
-        """
-        the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(
-            device)
-        return the_model
-
     def plot_confusion_matrix(y_preds, y_true, labels, show=True):
         cm = confusion_matrix(y_true, y_preds, normalize="true")
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -189,6 +175,17 @@ def main(params: DictConfig) -> None:
 
     ''' Find the best value for hyperparameters that govern the model's fine-tuning, if requested '''
 
+    def get_model(trial: opt.trial.Trial | None = None) -> DistilBertForSequenceClassification:
+        """
+        Returns the model. The signature of the function is such that it can be invoked by Optuna during
+        hyperparameters tuning.
+        :param trial: an Optuna Trial object, or None.
+        :return: the model instance. It is already in the GPU memory if a GPU is available.
+        """
+        the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(
+            device)
+        return the_model
+
     if params.train.tune:
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='hyperparemeters tuning'):
             info_active_run()
@@ -202,10 +199,9 @@ def main(params: DictConfig) -> None:
                 return res
 
             optuna_sampler = None if seed is None else TPESampler(seed=seed)
-            best_trial, _ = optimize(model=None,
+            best_trial, _ = optimize(model_init=get_model,
                                      early_stopping_patience=params.transformers.early_stopping_patience,
                                      overriding_params=None,
-                                     model_init=get_model,
                                      hp_space=hp_space,
                                      optuna_sampler=optuna_sampler)
             OmegaConf.save(best_trial.hyperparameters, best_trial_path)
@@ -220,9 +216,7 @@ def main(params: DictConfig) -> None:
             if Path(best_trial_path).exists():
                 info(f'Loading tuned hyper-parameters from {best_trial_path}')
                 best_trial_params = dict(OmegaConf.load(best_trial_path))
-            model = get_model()
-
-            training_metrics, trainer = optimize(model=model,
+            training_metrics, trainer = optimize(model_init=get_model,
                                                  early_stopping_patience=params.transformers.early_stopping_patience,
                                                  overriding_params=best_trial_params)
 
@@ -302,7 +296,10 @@ Fix reproducibility -> Done
 Make sure hyperparameters search works correctly -> Done
 Can fine-tuning be interrupted and resumed? -> Done, yes!
 
+Fix up call to optimize()
+Provide an easy way to coordinate the trial info (in the SQLite DB) with the run info in MLFlow
 Log with MLFlow the Optuna trial id of every nested run, also make sure the study name is logged
+
 Tag the best nested run as such, will have to remove and re-assign the tag of best nested run as needed 
 Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
     computed again later (is it even possible?)
