@@ -6,7 +6,9 @@ import random
 import mlflow as mf
 import numpy as np
 import transformers
+from matplotlib import pyplot as plt
 from mlflow.utils.name_utils import _generate_random_name
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from sklearn.metrics import accuracy_score, f1_score
 from transformers import TrainingArguments
 from transformers.integrations import MLflowCallback
@@ -20,6 +22,10 @@ warning = _logger.warning
 
 def xor(a: bool, b: bool) -> bool:
     return (a and not b) or (b and not a)
+
+
+def implies(a: bool, b: bool) -> bool:
+    return not a or b
 
 
 def info_active_run():
@@ -116,3 +122,13 @@ def get_name_for_run() -> str:
     name_for_run = _generate_random_name()
     random.setstate(curr_state)
     return name_for_run
+
+def plot_confusion_matrix(y_preds, y_true, labels, show=True):
+    cm = confusion_matrix(y_true, y_preds, normalize="true")
+    fig, ax = plt.subplots(figsize=(6, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp.plot(cmap="Blues", values_format=".2f", ax=ax, colorbar=False)
+    plt.title("Normalized confusion matrix")
+    if show:
+        plt.show()
+    return fig

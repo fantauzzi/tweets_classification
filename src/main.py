@@ -8,17 +8,18 @@ import optuna as opt
 import torch
 import transformers
 from datasets import load_dataset
+from datasets.arrow_dataset import Dataset
 from hydra.core.hydra_config import HydraConfig
-from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from optuna.pruners import NopPruner
 from optuna.samplers import TPESampler
-from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline, \
     DistilBertForSequenceClassification
 from transformers.integrations import MLflowCallback
 
-from utils import info, warning, info_active_run, MLFlowTrialCB, compute_metrics, get_name_for_run
+from utils import info, warning, info_active_run, MLFlowTrialCB, compute_metrics, get_name_for_run, implies, \
+    plot_confusion_matrix
 
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
@@ -38,9 +39,6 @@ def main(params: DictConfig) -> None:
     seed = params.transformers.get('seed')
     if seed is not None:
         transformers.set_seed(params.transformers.seed)
-        # MLFlow uses the random package to draw random run names, this below ensures the names are actually random
-        # TODO handle this properly
-        # random.seed()
 
     ''' Set various path '''
 
@@ -79,7 +77,7 @@ def main(params: DictConfig) -> None:
 
     # Save the output of nvidia-smi (GPU info) into a text file, log it with MLFlow then delete the file
     nvidia_info_filename = 'nvidia-smi.txt'
-    nvidia_info_path = repo_root = repo_root / nvidia_info_filename
+    nvidia_info_path = repo_root / nvidia_info_filename
     os.system(f'nvidia-smi -q > {nvidia_info_path}')
     mf.log_artifact(str(nvidia_info_path))
     nvidia_info_path.unlink(missing_ok=True)
@@ -104,7 +102,7 @@ def main(params: DictConfig) -> None:
                  overriding_params=None,
                  hp_space=None,
                  optuna_sampler=None):
-        assert (hp_space is None and optuna_sampler is None) or (hp_space is not None and optuna_sampler is not None)
+        assert implies(hp_space is None, optuna_sampler is None)
 
         training_args = TrainingArguments(output_dir=output_dir,
                                           num_train_epochs=params.transformers.epochs,
@@ -145,6 +143,8 @@ def main(params: DictConfig) -> None:
             trainer.add_callback(MLFlowTrialCB())
             study_name = params.fine_tuning.study_name
             trials_storage = f'sqlite:///../db/{study_name}.db'
+            ''' Careful: at the end of the hyperparameters tuning process, `trainer` contains the model as trained
+            by the *last* trial, not by the *best* trial '''
             res = trainer.hyperparameter_search(hp_space=hp_space,
                                                 n_trials=params.fine_tuning.n_trials,
                                                 direction='maximize',
@@ -161,18 +161,6 @@ def main(params: DictConfig) -> None:
 
         return res, trainer
 
-    def plot_confusion_matrix(y_preds, y_true, labels, show=True):
-        cm = confusion_matrix(y_true, y_preds, normalize="true")
-        fig, ax = plt.subplots(figsize=(6, 6))
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
-        disp.plot(cmap="Blues", values_format=".2f", ax=ax, colorbar=False)
-        plt.title("Normalized confusion matrix")
-        if show:
-            plt.show()
-        return fig
-
-    labels = emotions["train"].features["label"].names
-
     ''' Find the best value for hyperparameters that govern the model's fine-tuning, if requested '''
 
     def get_model(trial: opt.trial.Trial | None = None) -> DistilBertForSequenceClassification:
@@ -182,9 +170,15 @@ def main(params: DictConfig) -> None:
         :param trial: an Optuna Trial object, or None.
         :return: the model instance. It is already in the GPU memory if a GPU is available.
         """
+        seed = params.transformers.get('seed')
+        if seed is not None:
+            transformers.set_seed(params.transformers.seed)
+
         the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(
             device)
         return the_model
+
+    labels = emotions["train"].features["label"].names
 
     if params.train.tune:
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='hyperparemeters tuning'):
@@ -204,7 +198,7 @@ def main(params: DictConfig) -> None:
                                      overriding_params=None,
                                      hp_space=hp_space,
                                      optuna_sampler=optuna_sampler)
-            OmegaConf.save(best_trial.hyperparameters, best_trial_path)
+            OmegaConf.save(best_trial.hyperparameters, best_trial_path)  # Could also save how many epochs
 
     ''' Fine-tune the model if requested. Default hyperparameter values are taken from the config/params.yaml file, but 
     are then overridden by values taken from the models/saved_models/best_trial.yaml file if such file exists '''
@@ -224,33 +218,30 @@ def main(params: DictConfig) -> None:
 
         ''' Validate the model that has just been fine-tuned'''
 
-        with mf.start_run(run_name=get_name_for_run(), nested=True, description='fine-tuned model validation'):
-            info_active_run()
-            info(f'Validation set contains {len(emotions_encoded["validation"])} samples')
-            preds_output_val = trainer.predict(emotions_encoded["validation"])
-            info(f'Validation metrics\n{preds_output_val.metrics}')
+        def test_model(trainer: Trainer, dataset: Dataset, description: str, confusion_matrix_filename: str) -> None:
+            with mf.start_run(run_name=get_name_for_run(), nested=True, description=description):
+                info_active_run()
+                info(f'{description} - dataset contains {len(dataset)} samples')
+                preds_output_val = trainer.predict(dataset)
+                info(f'Result metrics:\n{preds_output_val.metrics}')
 
-            y_preds_val = np.argmax(preds_output_val.predictions, axis=1)
-            y_valid = np.array(emotions_encoded["validation"]["label"])
+                y_preds_val = np.argmax(preds_output_val.predictions, axis=1)
+                y_valid = np.array(dataset["label"])
 
-            fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
-            mf.log_figure(fig_val,
-                          'validation_confusion_matrix.png')  # PermissionError: [Errno 13] Permission denied: '/home/fanta'
+                fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
+                mf.log_figure(fig_val, confusion_matrix_filename)
+
+        test_model(trainer=trainer,
+                   dataset=emotions_encoded["validation"],
+                   description='Model validation after fine-tuning',
+                   confusion_matrix_filename='validation_confusion_matrix.png')
 
         ''' Test the model that has just been fine-tuned'''
 
-        with mf.start_run(run_name=get_name_for_run(), nested=True, description='fine-tuned model testing'):
-            info_active_run()
-            info(f'Test set contains {len(emotions_encoded["test"])} samples')
-            preds_output_test = trainer.predict(emotions_encoded["test"])
-            info(f'Test metrics\n{preds_output_test.metrics}')
-            mf.log_metrics(preds_output_test.metrics)
-
-            y_preds_test = np.argmax(preds_output_test.predictions, axis=1)
-            y_test = np.array(emotions_encoded["test"]["label"])
-
-            fig_test = plot_confusion_matrix(y_preds_test, y_test, labels, False)
-            mf.log_figure(fig_test, 'test_confusion_matrix.png')
+        test_model(trainer=trainer,
+                   dataset=emotions_encoded["test"],
+                   description='Model testing after fine tuning',
+                   confusion_matrix_filename='test_confusion_matrix.png')
 
     ''' Test the saved fine-tuned model if required. That is the same model that would be used for inference '''
 
@@ -265,6 +256,8 @@ def main(params: DictConfig) -> None:
             y_test = np.array(emotions["test"]["label"])
             f1 = f1_score(y_test, test_pred_labels, average="weighted")
             acc = accuracy_score(y_test, test_pred_labels)
+            info(
+                f'Testing inference pipeline with model loaded from {fine_tuned_model_path} - dataset contains {len(y_test)} samples')
             info(f'Test f1 is {f1} and test accuracy is {acc}')
             # TODO log these metrics with MLFlow ---^
 
@@ -295,8 +288,8 @@ Have actually random run names even with a set random seed -> Done
 Fix reproducibility -> Done
 Make sure hyperparameters search works correctly -> Done
 Can fine-tuning be interrupted and resumed? -> Done, yes!
+Fix up call to optimize() -> Done
 
-Fix up call to optimize()
 Provide an easy way to coordinate the trial info (in the SQLite DB) with the run info in MLFlow
 Log with MLFlow the Optuna trial id of every nested run, also make sure the study name is logged
 
