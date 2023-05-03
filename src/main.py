@@ -1,5 +1,6 @@
-import os
+from os import system
 from pathlib import Path
+from shutil import copytree, rmtree
 
 import hydra
 import mlflow as mf
@@ -53,7 +54,7 @@ def main(params: DictConfig) -> None:
     models_path = (repo_root / params.main.models_dir).resolve()
 
     # Absolute path the fine-tuned model are saved to/loaded from
-    fine_tuned_model_path = models_path / params.main.fine_tuned_model_dir
+    tuned_model_path = models_path / params.main.fine_tuned_model_dir
 
     # Absolute path where the hyperparameter values for the fine-tuned model are saved to/loaded from
     best_trial_path = models_path / 'best_trial.yaml'
@@ -78,7 +79,7 @@ def main(params: DictConfig) -> None:
     # Save the output of nvidia-smi (GPU info) into a text file, log it with MLFlow then delete the file
     nvidia_info_filename = 'nvidia-smi.txt'
     nvidia_info_path = repo_root / nvidia_info_filename
-    os.system(f'nvidia-smi -q > {nvidia_info_path}')
+    system(f'nvidia-smi -q > {nvidia_info_path}')
     mf.log_artifact(str(nvidia_info_path))
     nvidia_info_path.unlink(missing_ok=True)
 
@@ -108,7 +109,7 @@ def main(params: DictConfig) -> None:
                                           num_train_epochs=params.transformers.epochs,
                                           learning_rate=2e-5,
                                           per_device_train_batch_size=params.transformers.batch_size,
-                                          per_device_eval_batch_size=params.transformers.batch_size,
+                                          per_device_eval_batch_size=params.transformers.test_batch_size,
                                           weight_decay=0.01,
                                           evaluation_strategy="epoch",
                                           disable_tqdm=False,
@@ -116,9 +117,10 @@ def main(params: DictConfig) -> None:
                                           log_level="error",
                                           logging_strategy='epoch',
                                           report_to=['mlflow'],
-                                          logging_first_step=True,
+                                          logging_first_step=False,
                                           save_strategy='epoch',
-                                          load_best_model_at_end=True)
+                                          load_best_model_at_end=True,
+                                          seed=params.transformers.get('seed'))
 
         if overriding_params is not None:
             for key, value in overriding_params.items():
@@ -170,12 +172,8 @@ def main(params: DictConfig) -> None:
         :param trial: an Optuna Trial object, or None.
         :return: the model instance. It is already in the GPU memory if a GPU is available.
         """
-        seed = params.transformers.get('seed')
-        if seed is not None:
-            transformers.set_seed(params.transformers.seed)
-
-        the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=num_labels).to(
-            device)
+        the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model,
+                                                                       num_labels=num_labels).to(device)
         return the_model
 
     labels = emotions["train"].features["label"].names
@@ -193,12 +191,36 @@ def main(params: DictConfig) -> None:
                 return res
 
             optuna_sampler = None if seed is None else TPESampler(seed=seed)
-            best_trial, _ = optimize(model_init=get_model,
-                                     early_stopping_patience=params.transformers.early_stopping_patience,
-                                     overriding_params=None,
-                                     hp_space=hp_space,
-                                     optuna_sampler=optuna_sampler)
+            best_trial, trainer = optimize(model_init=get_model,
+                                           early_stopping_patience=params.transformers.early_stopping_patience,
+                                           overriding_params=None,
+                                           hp_space=hp_space,
+                                           optuna_sampler=optuna_sampler)
+            info(f'Hyperparameters tuning completed')
+            info(f'  Best model has optimizing metric {trainer.state.best_metric}')
+            info(f'  achieved at epoch {trainer.state.epoch}')
+            info(f'  of global step {trainer.state.global_step}')
+            checkpoint_path = trainer.state.best_model_checkpoint
+            info(f'  saved in checkpoint {checkpoint_path}')
+            info('  it has the following tuned hyperparameters value:')
+            for key, value in trainer.state.trial_params.items():
+                info(f'    {key} = {value}')
+            for log_entry in trainer.state.log_history:
+                if log_entry['step'] == trainer.state.global_step and log_entry.get('eval_loss') is not None:
+                    info('  evaluation stats:')
+                    for stat_name, stat_value in log_entry.items():
+                        info(f'    {stat_name} = {stat_value}')
+                    assert log_entry['eval_loss'] == trainer.state.best_metric
+
+            # TODO see how much of the state.log_history you want to log with MLFlow, also to make charts
             OmegaConf.save(best_trial.hyperparameters, best_trial_path)  # Could also save how many epochs
+            if Path(tuned_model_path).exists():
+                info(
+                    f'Overwriting {tuned_model_path} with model with newly tuned hyperparameters')
+                rmtree(tuned_model_path)
+            else:
+                info(f'Saving model with tuned hyperparameters into {tuned_model_path}')
+            copytree(checkpoint_path, tuned_model_path)
 
     ''' Fine-tune the model if requested. Default hyperparameter values are taken from the config/params.yaml file, but 
     are then overridden by values taken from the models/saved_models/best_trial.yaml file if such file exists '''
@@ -214,7 +236,7 @@ def main(params: DictConfig) -> None:
                                                  early_stopping_patience=params.transformers.early_stopping_patience,
                                                  overriding_params=best_trial_params)
 
-            trainer.save_model(fine_tuned_model_path)
+            trainer.save_model(tuned_model_path)
 
         ''' Validate the model that has just been fine-tuned'''
 
@@ -248,16 +270,26 @@ def main(params: DictConfig) -> None:
     if params.train.test:
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='inference testing with saved model'):
             info_active_run()
-            model = AutoModelForSequenceClassification.from_pretrained(fine_tuned_model_path)
-            tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_path)
+            model = AutoModelForSequenceClassification.from_pretrained(tuned_model_path)
+            tokenizer = AutoTokenizer.from_pretrained(tuned_model_path)
             pipe = pipeline(model=model, task='text-classification', tokenizer=tokenizer, device=0)
+
+            val_pred = pipe(emotions['validation']['text'])
+            val_pred_labels = np.array([int(item['label'][-1]) for item in val_pred])
+            y_val = np.array(emotions["validation"]["label"])
+            f1 = f1_score(y_val, val_pred_labels, average="weighted")
+            acc = accuracy_score(y_val, val_pred_labels)
+            info(
+                f'Validating inference pipeline with model loaded from {tuned_model_path} - dataset contains {len(y_val)} samples')
+            info(f'Validation f1 is {f1} and validation accuracy is {acc}')
+
             test_pred = pipe(emotions['test']['text'])
             test_pred_labels = np.array([int(item['label'][-1]) for item in test_pred])
             y_test = np.array(emotions["test"]["label"])
             f1 = f1_score(y_test, test_pred_labels, average="weighted")
             acc = accuracy_score(y_test, test_pred_labels)
             info(
-                f'Testing inference pipeline with model loaded from {fine_tuned_model_path} - dataset contains {len(y_test)} samples')
+                f'Testing inference pipeline with model loaded from {tuned_model_path} - dataset contains {len(y_test)} samples')
             info(f'Test f1 is {f1} and test accuracy is {acc}')
             # TODO log these metrics with MLFlow ---^
 

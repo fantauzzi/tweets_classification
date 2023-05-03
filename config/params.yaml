@@ -3,17 +3,18 @@ main:
   fine_tuned_model_dir: saved_model
 train:
   tune: True  # Hyperparameters
-  fine_tune: True  # Pre-trained model
+  fine_tune: False  # Pre-trained model
   test: True
 fine_tuning:
   study_name: trials
   resume_previous: yes
-  n_trials: 2
+  n_trials: 4
 mlflow:
   tracking_uri: mlruns # Relative to the root of the repo, currently only a local path is supported as uri
 transformers:
   seed: 8833
   pretrained_model: 'distilbert-base-uncased'
-  epochs: 3
+  epochs: 6
   batch_size: 256
+  test_batch_size: 256
   early_stopping_patience: 1
