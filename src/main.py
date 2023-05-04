@@ -184,8 +184,8 @@ def main(params: DictConfig) -> None:
 
             def hp_space(trial: opt.trial.Trial) -> dict:
                 res = {
-                    "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True),
-                    "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size",
+                    'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
+                    'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
                                                                              [64, 128, 192, 256]),
                 }
                 return res

@@ -14,7 +14,7 @@ mlflow:
 transformers:
   seed: 8833
   pretrained_model: 'distilbert-base-uncased'
-  epochs: 6
+  epochs: 2
   batch_size: 256
   test_batch_size: 256
   early_stopping_patience: 1
