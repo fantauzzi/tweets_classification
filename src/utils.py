@@ -133,3 +133,10 @@ def plot_confusion_matrix(y_preds, y_true, labels, show=True):
     if show:
         plt.show()
     return fig
+
+
+def get_eval_f1_from_state_log(log_history: list[dict], step: int) -> float:
+    for entry in log_history:
+        if entry.get('step') == step and entry.get('eval_f1') is not None:
+            return entry['eval_f1']
+    assert False

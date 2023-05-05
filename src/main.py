@@ -5,22 +5,19 @@ from shutil import copytree, rmtree
 import hydra
 import mlflow as mf
 import numpy as np
-import optuna as opt
+import optuna
 import torch
 import transformers
 from datasets import load_dataset
 from datasets.arrow_dataset import Dataset
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from optuna.pruners import NopPruner
-from optuna.samplers import TPESampler
 from sklearn.metrics import accuracy_score, f1_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, pipeline, \
     DistilBertForSequenceClassification
-from transformers.integrations import MLflowCallback
 
-from utils import info, warning, info_active_run, MLFlowTrialCB, compute_metrics, get_name_for_run, implies, \
-    plot_confusion_matrix
+from utils import info, warning, info_active_run, compute_metrics, get_name_for_run, plot_confusion_matrix, \
+    get_eval_f1_from_state_log
 
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
@@ -53,11 +50,11 @@ def main(params: DictConfig) -> None:
     # Absolute path to the directory where model and model checkpoints are to be saved and loaded from
     models_path = (repo_root / params.main.models_dir).resolve()
 
-    # Absolute path the fine-tuned model are saved to/loaded from
+    # Absolute path the fine-tuned model is saved to/loaded from
     tuned_model_path = models_path / params.main.fine_tuned_model_dir
 
     # Absolute path where the hyperparameter values for the fine-tuned model are saved to/loaded from
-    best_trial_path = models_path / 'best_trial.yaml'
+    params_override_path = models_path / 'params_override.yaml'
 
     ''' If there is no MLFlow run currently ongoing, then start one. Note that is this script has been started from
      shell with `mlflow run` then a run is ongoing already, no need to start it'''
@@ -92,84 +89,52 @@ def main(params: DictConfig) -> None:
 
     emotions_encoded = emotions.map(tokenize, batched=True, batch_size=None)
 
-    num_labels = 6  # Yuck!
+    num_labels = 6
 
     info(f'Training set contains {len(emotions_encoded["train"])} samples')
     model_name = f"{pretrained_model}-finetuned-emotion"
     output_dir = str(models_path / model_name)
 
-    def optimize(model_init,
-                 early_stopping_patience,
-                 overriding_params=None,
-                 hp_space=None,
-                 optuna_sampler=None):
-        assert implies(hp_space is None, optuna_sampler is None)
+    def train(model_init, description, params_ovveride=None):
+        with mf.start_run(run_name=get_name_for_run(), nested=True, description=description):
+            training_args = TrainingArguments(output_dir=output_dir,
+                                              num_train_epochs=params.transformers.epochs,
+                                              learning_rate=2e-5,
+                                              per_device_train_batch_size=params.transformers.batch_size,
+                                              per_device_eval_batch_size=params.transformers.test_batch_size,
+                                              weight_decay=0.01,
+                                              evaluation_strategy="epoch",
+                                              disable_tqdm=False,
+                                              push_to_hub=False,
+                                              log_level="error",
+                                              logging_strategy='epoch',
+                                              report_to=['mlflow'],
+                                              logging_first_step=False,
+                                              save_strategy='epoch',
+                                              load_best_model_at_end=True,
+                                              seed=params.transformers.get('seed'))
 
-        training_args = TrainingArguments(output_dir=output_dir,
-                                          num_train_epochs=params.transformers.epochs,
-                                          learning_rate=2e-5,
-                                          per_device_train_batch_size=params.transformers.batch_size,
-                                          per_device_eval_batch_size=params.transformers.test_batch_size,
-                                          weight_decay=0.01,
-                                          evaluation_strategy="epoch",
-                                          disable_tqdm=False,
-                                          push_to_hub=False,
-                                          log_level="error",
-                                          logging_strategy='epoch',
-                                          report_to=['mlflow'],
-                                          logging_first_step=False,
-                                          save_strategy='epoch',
-                                          load_best_model_at_end=True,
-                                          seed=params.transformers.get('seed'))
+            if params_ovveride is not None:
+                for key, value in params_ovveride.items():
+                    setattr(training_args, key, value)
 
-        if overriding_params is not None:
-            for key, value in overriding_params.items():
-                setattr(training_args, key, value)
+            callbacks = [
+                transformers.EarlyStoppingCallback(early_stopping_patience=params.transformers.early_stopping_patience)]
 
-        callbacks = [transformers.EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
+            trainer = Trainer(model=model_init(),
+                              args=training_args,
+                              compute_metrics=compute_metrics,
+                              train_dataset=emotions_encoded["train"],
+                              eval_dataset=emotions_encoded["validation"],
+                              tokenizer=tokenizer,
+                              callbacks=callbacks)
 
-        trainer = Trainer(model=model_init() if hp_space is None else None,
-                          args=training_args,
-                          compute_metrics=compute_metrics,
-                          train_dataset=emotions_encoded["train"],
-                          eval_dataset=emotions_encoded["validation"],
-                          tokenizer=tokenizer,
-                          model_init=model_init if hp_space is not None else None,
-                          callbacks=callbacks)
-
-        if hp_space is not None:
-            def compute_objective(metrics: dict) -> float:
-                return metrics['eval_f1']
-
-            trainer.remove_callback(MLflowCallback)
-            trainer.add_callback(MLFlowTrialCB())
-            study_name = params.fine_tuning.study_name
-            trials_storage = f'sqlite:///../db/{study_name}.db'
-            ''' Careful: at the end of the hyperparameters tuning process, `trainer` contains the model as trained
-            by the *last* trial, not by the *best* trial '''
-            res = trainer.hyperparameter_search(hp_space=hp_space,
-                                                n_trials=params.fine_tuning.n_trials,
-                                                direction='maximize',
-                                                compute_objective=compute_objective,
-                                                sampler=optuna_sampler,
-                                                study_name=study_name,
-                                                storage=trials_storage,
-                                                load_if_exists=params.fine_tuning.resume_previous,
-                                                pruner=NopPruner())
-            info(f'Best run: {res}')
-        else:
             res = trainer.train()
-            info(f'Fine tuning results: {res}')
+            return res, trainer
 
-        return res, trainer
-
-    ''' Find the best value for hyperparameters that govern the model's fine-tuning, if requested '''
-
-    def get_model(trial: opt.trial.Trial | None = None) -> DistilBertForSequenceClassification:
+    def get_model() -> DistilBertForSequenceClassification:
         """
-        Returns the model. The signature of the function is such that it can be invoked by Optuna during
-        hyperparameters tuning.
-        :param trial: an Optuna Trial object, or None.
+        Returns the pre-trained model.
         :return: the model instance. It is already in the GPU memory if a GPU is available.
         """
         the_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model,
@@ -178,49 +143,71 @@ def main(params: DictConfig) -> None:
 
     labels = emotions["train"].features["label"].names
 
+    ''' Hyperparameters tuning, starting from a pre-trained model '''
+
     if params.train.tune:
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='hyperparemeters tuning'):
             info_active_run()
 
-            def hp_space(trial: opt.trial.Trial) -> dict:
-                res = {
-                    'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
-                    'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
-                                                                             [64, 128, 192, 256]),
-                }
-                return res
+            class Objective:
+                """
+                The class provides a callback that can be passed to Optuna for its optimization process. Instances
+                of the class also provide storage for the evaluation metric (F1) for the best model trained so far.
+                """
 
-            optuna_sampler = None if seed is None else TPESampler(seed=seed)
-            best_trial, trainer = optimize(model_init=get_model,
-                                           early_stopping_patience=params.transformers.early_stopping_patience,
-                                           overriding_params=None,
-                                           hp_space=hp_space,
-                                           optuna_sampler=optuna_sampler)
+                def __init__(self):
+                    self._best_eval_f1 = None
+
+                def function(self, trial: optuna.trial.Trial) -> float:
+                    """
+                    Callback meant to be passed to Optuna for its optimization process, performs the computation for
+                    one trial and returns the value of its resulting evaluation metric (F1).
+                    :param trial: instance of Optuna Trial that Optuna will pass to the callback during the optimization
+                    process.
+                    :return: the evaluation metric for the trial.
+                    """
+                    description = 'trial for hyperparameters tuning'
+                    with mf.start_run(run_name=get_name_for_run(),
+                                      nested=True,
+                                      description=description):
+                        trial_params = {
+                            'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
+                            'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
+                                                                                     [64, 128, 192, 256])}
+                        res, trainer = train(model_init=get_model,
+                                             description=description,
+                                             params_ovveride=trial_params)
+
+                        ''' Update information on the best trial so far as needed, and ensure the best trained model so
+                        far is saved '''
+
+                        eval_f1 = get_eval_f1_from_state_log(trainer.state.log_history, res.global_step)
+                        if self._best_eval_f1 is None or self._best_eval_f1 < eval_f1:
+                            info(f'Current trial improved the evaluation metric from {self._best_eval_f1} to {eval_f1}')
+                            self._best_eval_f1 = eval_f1
+                            if Path(tuned_model_path).exists():
+                                info(
+                                    f'Overwriting {tuned_model_path} with model with best tuned hyperparameters so far')
+                                rmtree(tuned_model_path)
+                            else:
+                                info(f'Saving model with best tuned hyperparameters so far into {tuned_model_path}')
+                            copytree(trainer.state.best_model_checkpoint, tuned_model_path)
+                            info(f'Saving best choice of hyperparemeters so far into {params_override_path}')
+                            OmegaConf.save(trial_params, params_override_path)
+
+                        return eval_f1
+
+            study_name = params.fine_tuning.study_name
+            optuna_db =  params.fine_tuning.optuna_db
+            trials_storage = f'sqlite:///../db/{optuna_db}'
+            study = optuna.create_study(study_name=study_name,
+                                        storage=trials_storage,
+                                        load_if_exists=params.fine_tuning.resume_previous)
+            objective = Objective()
+            study.optimize(func=objective.function, n_trials=params.fine_tuning.n_trials)
+
             info(f'Hyperparameters tuning completed')
-            info(f'  Best model has optimizing metric {trainer.state.best_metric}')
-            info(f'  achieved at epoch {trainer.state.epoch}')
-            info(f'  of global step {trainer.state.global_step}')
-            checkpoint_path = trainer.state.best_model_checkpoint
-            info(f'  saved in checkpoint {checkpoint_path}')
-            info('  it has the following tuned hyperparameters value:')
-            for key, value in trainer.state.trial_params.items():
-                info(f'    {key} = {value}')
-            for log_entry in trainer.state.log_history:
-                if log_entry['step'] == trainer.state.global_step and log_entry.get('eval_loss') is not None:
-                    info('  evaluation stats:')
-                    for stat_name, stat_value in log_entry.items():
-                        info(f'    {stat_name} = {stat_value}')
-                    assert log_entry['eval_loss'] == trainer.state.best_metric
-
-            # TODO see how much of the state.log_history you want to log with MLFlow, also to make charts
-            OmegaConf.save(best_trial.hyperparameters, best_trial_path)  # Could also save how many epochs
-            if Path(tuned_model_path).exists():
-                info(
-                    f'Overwriting {tuned_model_path} with model with newly tuned hyperparameters')
-                rmtree(tuned_model_path)
-            else:
-                info(f'Saving model with tuned hyperparameters into {tuned_model_path}')
-            copytree(checkpoint_path, tuned_model_path)
+            # TODO log stats here, also with MLFlow
 
     ''' Fine-tune the model if requested. Default hyperparameter values are taken from the config/params.yaml file, but 
     are then overridden by values taken from the models/saved_models/best_trial.yaml file if such file exists '''
@@ -228,14 +215,14 @@ def main(params: DictConfig) -> None:
     if params.train.fine_tune:
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='pre-trained model fine-tuning'):
             info_active_run()
-            best_trial_params = None
-            if Path(best_trial_path).exists():
-                info(f'Loading tuned hyper-parameters from {best_trial_path}')
-                best_trial_params = dict(OmegaConf.load(best_trial_path))
-            training_metrics, trainer = optimize(model_init=get_model,
-                                                 early_stopping_patience=params.transformers.early_stopping_patience,
-                                                 overriding_params=best_trial_params)
-
+            params_override = None
+            if Path(params_override_path).exists():
+                info(f'Loading parameters overried from {params_override_path}')
+                params_override = dict(OmegaConf.load(params_override_path))
+            res, trainer = train(model_init=get_model(),
+                                 params_ovveride=params_override,
+                                 description='pre-trained model tuning with given hyperparameters')
+            info(f'Mode fine tuning results: {res}')
             trainer.save_model(tuned_model_path)
 
         ''' Validate the model that has just been fine-tuned'''
