@@ -35,8 +35,8 @@ def main(params: DictConfig) -> None:
     ''' Set the RNG seed to make runs reproducible '''
 
     seed = params.transformers.get('seed')
-    if seed is not None:
-        transformers.set_seed(params.transformers.seed)
+    """if seed is not None:
+        transformers.set_seed(params.transformers.seed)"""
 
     ''' Set various path '''
 
@@ -148,58 +148,59 @@ def main(params: DictConfig) -> None:
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='hyperparemeters tuning'):
             info_active_run()
 
-            class Objective:
+            def trial_CB(trial: optuna.trial.Trial) -> float:
                 """
-                The class provides a callback that can be passed to Optuna for its optimization process. Instances
-                of the class also provide storage for the evaluation metric (F1) for the best model trained so far.
+                Callback meant to be passed to Optuna for its optimization process, performs the computation for
+                one trial and returns the value of its resulting evaluation metric (F1).
+                :param trial: instance of Optuna Trial that Optuna will pass to the callback during the optimization
+                process.
+                :return: the evaluation metric for the current trial
                 """
+                with mf.start_run(run_name=get_name_for_run(),
+                                  nested=True,
+                                  description='trial for hyperparameters tuning'):
+                    trial_params = {
+                        'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
+                        'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
+                                                                                 [64, 128, 192, 256])}
+                    res, trainer = train(model_init=get_model, params_ovveride=trial_params)
+                    ''' Update information on the best trial so far as needed, and ensure the best trained model so
+                    far is saved '''
 
-                def __init__(self):
-                    self._best_eval_f1 = None
+                    eval_f1 = get_eval_f1_from_state_log(trainer.state.log_history, res.global_step)
+                    if not trial.study.best_trials or eval_f1 > trial.study.best_value:
+                        # if self._best_eval_f1 is None or self._best_eval_f1 < eval_f1:
+                        if not trial.study.best_trials:
+                            info(f'First trial completed with evaluation metric {eval_f1}')
+                        else:
+                            info(
+                                f'Current trial improved the evaluation metric from {trial.study.best_value} to {eval_f1}')
+                        # self._best_eval_f1 = eval_f1
+                        if Path(tuned_model_path).exists():
+                            info(
+                                f'Overwriting {tuned_model_path} with model with best tuned hyperparameters so far')
+                            rmtree(tuned_model_path)
+                        else:
+                            info(f'Checkpoint with best tuned hyperparameters so far is {trainer.state.best_model_checkpoint}')
+                            info(f'Saving model (checkpoint) with best tuned hyperparameters so far into {tuned_model_path}')
+                        copytree(trainer.state.best_model_checkpoint, tuned_model_path)
+                        info(f'Saving best choice of hyperparemeters so far into {params_override_path}')
+                        OmegaConf.save(trial_params, params_override_path)
 
-                def function(self, trial: optuna.trial.Trial) -> float:
-                    """
-                    Callback meant to be passed to Optuna for its optimization process, performs the computation for
-                    one trial and returns the value of its resulting evaluation metric (F1).
-                    :param trial: instance of Optuna Trial that Optuna will pass to the callback during the optimization
-                    process.
-                    :return: the evaluation metric for the trial.
-                    """
-                    with mf.start_run(run_name=get_name_for_run(),
-                                      nested=True,
-                                      description='trial for hyperparameters tuning'):
-                        trial_params = {
-                            'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
-                            'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
-                                                                                     [64, 128, 192, 256])}
-                        res, trainer = train(model_init=get_model, params_ovveride=trial_params)
-                        ''' Update information on the best trial so far as needed, and ensure the best trained model so
-                        far is saved '''
-
-                        eval_f1 = get_eval_f1_from_state_log(trainer.state.log_history, res.global_step)
-                        if self._best_eval_f1 is None or self._best_eval_f1 < eval_f1:
-                            info(f'Current trial improved the evaluation metric from {self._best_eval_f1} to {eval_f1}')
-                            self._best_eval_f1 = eval_f1
-                            if Path(tuned_model_path).exists():
-                                info(
-                                    f'Overwriting {tuned_model_path} with model with best tuned hyperparameters so far')
-                                rmtree(tuned_model_path)
-                            else:
-                                info(f'Saving model with best tuned hyperparameters so far into {tuned_model_path}')
-                            copytree(trainer.state.best_model_checkpoint, tuned_model_path)
-                            info(f'Saving best choice of hyperparemeters so far into {params_override_path}')
-                            OmegaConf.save(trial_params, params_override_path)
-
-                        return eval_f1
+                    return eval_f1
 
             study_name = params.fine_tuning.study_name
             optuna_db = params.fine_tuning.optuna_db
             trials_storage = f'sqlite:///../db/{optuna_db}'
+            sampler = optuna.samplers.TPESampler(seed=seed)
+            pruner = optuna.pruners.NopPruner()
             study = optuna.create_study(study_name=study_name,
                                         storage=trials_storage,
-                                        load_if_exists=params.fine_tuning.resume_previous)
-            objective = Objective()  # TODO make pruning optional and configurable
-            study.optimize(func=objective.function, n_trials=params.fine_tuning.n_trials)
+                                        load_if_exists=params.fine_tuning.resume_previous,
+                                        sampler=sampler,
+                                        pruner=pruner,
+                                        direction='maximize')
+            study.optimize(func=trial_CB, n_trials=params.fine_tuning.n_trials)
 
             info(f'Hyperparameters tuning completed')
             # TODO log stats here, also with MLFlow
@@ -218,8 +219,6 @@ def main(params: DictConfig) -> None:
             info(f'Mode fine tuning results: {res}')
             trainer.save_model(tuned_model_path)
 
-        ''' Validate the model that has just been fine-tuned'''
-
         def test_model(trainer: Trainer, dataset: Dataset, description: str, confusion_matrix_filename: str) -> None:
             with mf.start_run(run_name=get_name_for_run(), nested=True, description=description):
                 info_active_run()
@@ -232,6 +231,8 @@ def main(params: DictConfig) -> None:
 
                 fig_val = plot_confusion_matrix(y_preds_val, y_valid, labels, False)
                 mf.log_figure(fig_val, confusion_matrix_filename)
+
+        ''' Validate the model that has just been fine-tuned'''
 
         test_model(trainer=trainer,
                    dataset=emotions_encoded["validation"],
