@@ -95,42 +95,41 @@ def main(params: DictConfig) -> None:
     model_name = f"{pretrained_model}-finetuned-emotion"
     output_dir = str(models_path / model_name)
 
-    def train(model_init, description, params_ovveride=None):
-        with mf.start_run(run_name=get_name_for_run(), nested=True, description=description):
-            training_args = TrainingArguments(output_dir=output_dir,
-                                              num_train_epochs=params.transformers.epochs,
-                                              learning_rate=2e-5,
-                                              per_device_train_batch_size=params.transformers.batch_size,
-                                              per_device_eval_batch_size=params.transformers.test_batch_size,
-                                              weight_decay=0.01,
-                                              evaluation_strategy="epoch",
-                                              disable_tqdm=False,
-                                              push_to_hub=False,
-                                              log_level="error",
-                                              logging_strategy='epoch',
-                                              report_to=['mlflow'],
-                                              logging_first_step=False,
-                                              save_strategy='epoch',
-                                              load_best_model_at_end=True,
-                                              seed=params.transformers.get('seed'))
+    def train(model_init, params_ovveride=None):
+        training_args = TrainingArguments(output_dir=output_dir,
+                                          num_train_epochs=params.transformers.epochs,
+                                          learning_rate=2e-5,
+                                          per_device_train_batch_size=params.transformers.batch_size,
+                                          per_device_eval_batch_size=params.transformers.test_batch_size,
+                                          weight_decay=0.01,
+                                          evaluation_strategy="epoch",
+                                          disable_tqdm=False,
+                                          push_to_hub=False,
+                                          log_level="error",
+                                          logging_strategy='epoch',
+                                          report_to=['mlflow'],
+                                          logging_first_step=False,
+                                          save_strategy='epoch',
+                                          load_best_model_at_end=True,
+                                          seed=params.transformers.get('seed'))
 
-            if params_ovveride is not None:
-                for key, value in params_ovveride.items():
-                    setattr(training_args, key, value)
+        if params_ovveride is not None:
+            for key, value in params_ovveride.items():
+                setattr(training_args, key, value)
 
-            callbacks = [
-                transformers.EarlyStoppingCallback(early_stopping_patience=params.transformers.early_stopping_patience)]
+        callbacks = [
+            transformers.EarlyStoppingCallback(early_stopping_patience=params.transformers.early_stopping_patience)]
 
-            trainer = Trainer(model=model_init(),
-                              args=training_args,
-                              compute_metrics=compute_metrics,
-                              train_dataset=emotions_encoded["train"],
-                              eval_dataset=emotions_encoded["validation"],
-                              tokenizer=tokenizer,
-                              callbacks=callbacks)
+        trainer = Trainer(model=model_init(),
+                          args=training_args,
+                          compute_metrics=compute_metrics,
+                          train_dataset=emotions_encoded["train"],
+                          eval_dataset=emotions_encoded["validation"],
+                          tokenizer=tokenizer,
+                          callbacks=callbacks)
 
-            res = trainer.train()
-            return res, trainer
+        res = trainer.train()
+        return res, trainer
 
     def get_model() -> DistilBertForSequenceClassification:
         """
@@ -166,18 +165,14 @@ def main(params: DictConfig) -> None:
                     process.
                     :return: the evaluation metric for the trial.
                     """
-                    description = 'trial for hyperparameters tuning'
                     with mf.start_run(run_name=get_name_for_run(),
                                       nested=True,
-                                      description=description):
+                                      description='trial for hyperparameters tuning'):
                         trial_params = {
                             'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
                             'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
                                                                                      [64, 128, 192, 256])}
-                        res, trainer = train(model_init=get_model,
-                                             description=description,
-                                             params_ovveride=trial_params)
-
+                        res, trainer = train(model_init=get_model, params_ovveride=trial_params)
                         ''' Update information on the best trial so far as needed, and ensure the best trained model so
                         far is saved '''
 
@@ -198,12 +193,12 @@ def main(params: DictConfig) -> None:
                         return eval_f1
 
             study_name = params.fine_tuning.study_name
-            optuna_db =  params.fine_tuning.optuna_db
+            optuna_db = params.fine_tuning.optuna_db
             trials_storage = f'sqlite:///../db/{optuna_db}'
             study = optuna.create_study(study_name=study_name,
                                         storage=trials_storage,
                                         load_if_exists=params.fine_tuning.resume_previous)
-            objective = Objective()
+            objective = Objective()  # TODO make pruning optional and configurable
             study.optimize(func=objective.function, n_trials=params.fine_tuning.n_trials)
 
             info(f'Hyperparameters tuning completed')
@@ -219,9 +214,7 @@ def main(params: DictConfig) -> None:
             if Path(params_override_path).exists():
                 info(f'Loading parameters overried from {params_override_path}')
                 params_override = dict(OmegaConf.load(params_override_path))
-            res, trainer = train(model_init=get_model(),
-                                 params_ovveride=params_override,
-                                 description='pre-trained model tuning with given hyperparameters')
+            res, trainer = train(model_init=get_model(), params_ovveride=params_override)
             info(f'Mode fine tuning results: {res}')
             trainer.save_model(tuned_model_path)
 
