@@ -11,15 +11,15 @@ eval "$(pyenv virtualenv-init -)"
 echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.profile
 echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.profile
 echo 'eval "$(pyenv init -)"' >> ~/.profile
-echo 'pyenv activate python3.10.7' >> ~/.profile
+echo 'pyenv activate python3.11.3' >> ~/.profile
 
 # Python virtualenv setup
-pyenv install 3.10.7
-pyenv virtualenv 3.10.7 python3.10.7
+pyenv install 3.11.3
+pyenv virtualenv 3.11.3 python3.11.3
 export PYENV_ROOT="$HOME/.pyenv"
 command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
 eval "$(pyenv init -)"
-pyenv activate python3.10.7
+pyenv activate python3.11.3
 
 # Python packages
 # rsync -azP --exclude=models /home/fanta/workspace/tweets_classification <destination>

@@ -93,9 +93,8 @@ def main(params: DictConfig) -> None:
 
     info(f'Training set contains {len(emotions_encoded["train"])} samples')
     model_name = f"{pretrained_model}-finetuned-emotion"
-    output_dir = str(models_path / model_name)
 
-    def train(model_init, params_ovveride=None):
+    def train(model_init, output_dir, params_ovveride=None):
         training_args = TrainingArguments(output_dir=output_dir,
                                           num_train_epochs=params.transformers.epochs,
                                           learning_rate=2e-5,
@@ -173,7 +172,8 @@ def main(params: DictConfig) -> None:
                     info('Parameters drawn for this trial:')
                     for key, value in trial_params.items():
                         info(f'  {key} = {value}')
-                    res, trainer = train(model_init=get_model, params_ovveride=trial_params)
+                    output_dir = str(models_path / model_name / f'study-{trial.study.study_name}-trial-{trial.number}')
+                    res, trainer = train(model_init=get_model, output_dir=output_dir, params_ovveride=trial_params)
                     ''' Update information on the best trial so far as needed, and ensure the best trained model so
                     far is saved '''
 
@@ -188,13 +188,11 @@ def main(params: DictConfig) -> None:
                         # self._best_eval_f1 = eval_f1
                         if Path(tuned_model_path).exists():
                             info(
-                                f'Overwriting {tuned_model_path} with model with best tuned hyperparameters so far')
+                                f'Overwriting {tuned_model_path} with model with best tuned hyperparameters so far, coming from checkpoint {trainer.state.best_model_checkpoint}')
                             rmtree(tuned_model_path)
                         else:
                             info(
-                                f'Checkpoint with best tuned hyperparameters so far is {trainer.state.best_model_checkpoint}')
-                            info(
-                                f'Saving model (checkpoint) with best tuned hyperparameters so far into {tuned_model_path}')
+                                f'Saving model with best tuned hyperparameters so far into {tuned_model_path}, coming from checkpoint {trainer.state.best_model_checkpoint}')
                         copytree(trainer.state.best_model_checkpoint, tuned_model_path)
                         info(f'Saving best choice of hyperparemeters so far into {params_override_path}')
                         OmegaConf.save(trial_params, params_override_path)
@@ -238,7 +236,8 @@ def main(params: DictConfig) -> None:
             if Path(params_override_path).exists():
                 info(f'Loading parameters overried from {params_override_path}')
                 params_override = dict(OmegaConf.load(params_override_path))
-            res, trainer = train(model_init=get_model, params_ovveride=params_override)
+            output_dir = str(models_path / model_name / 'fine-tuning')
+            res, trainer = train(model_init=get_model, output_dir=output_dir, params_ovveride=params_override)
             info(f'Mode fine tuning results: {res}')
             trainer.save_model(tuned_model_path)
 
