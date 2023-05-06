@@ -34,11 +34,11 @@ def main(params: DictConfig) -> None:
 
     ''' Set the RNG seed to make runs reproducible '''
 
-    seed = params.transformers.get('seed')
-    """if seed is not None:
+    """seed = params.transformers.get('seed')
+    if seed is not None:
         transformers.set_seed(params.transformers.seed)"""
 
-    ''' Set various path '''
+    ''' Set various paths '''
 
     # Absolute path to the repo root in the local filesystem
     repo_root = Path('..').resolve()
@@ -129,6 +129,7 @@ def main(params: DictConfig) -> None:
                           callbacks=callbacks)
 
         res = trainer.train()
+        info(f'Model tuning completed with results {res}')
         return res, trainer
 
     def get_model() -> DistilBertForSequenceClassification:
@@ -145,6 +146,7 @@ def main(params: DictConfig) -> None:
     ''' Hyperparameters tuning, starting from a pre-trained model '''
 
     if params.train.tune:
+        info('Starting hyperparameters tuning')
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='hyperparemeters tuning'):
             info_active_run()
 
@@ -156,6 +158,11 @@ def main(params: DictConfig) -> None:
                 process.
                 :return: the evaluation metric for the current trial
                 """
+
+                # random_state1 = trial.study.sampler._rng._bit_generator.state
+                # random_state2 = trial.study.sampler._random_sampler._rng._bit_generator.state
+                info(
+                    f'Starting trial No. {trial.number} of study {trial.study.study_name}, wich contains a total of {len(trial.study.trials)} trial(s) so far')
                 with mf.start_run(run_name=get_name_for_run(),
                                   nested=True,
                                   description='trial for hyperparameters tuning'):
@@ -163,6 +170,9 @@ def main(params: DictConfig) -> None:
                         'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
                         'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
                                                                                  [64, 128, 192, 256])}
+                    info('Parameters drawn for this trial:')
+                    for key, value in trial_params.items():
+                        info(f'  {key} = {value}')
                     res, trainer = train(model_init=get_model, params_ovveride=trial_params)
                     ''' Update information on the best trial so far as needed, and ensure the best trained model so
                     far is saved '''
@@ -174,25 +184,30 @@ def main(params: DictConfig) -> None:
                             info(f'First trial completed with evaluation metric {eval_f1}')
                         else:
                             info(
-                                f'Current trial improved the evaluation metric from {trial.study.best_value} to {eval_f1}')
+                                f'Current trial (No. {trial.number}) improved the evaluation metric from {trial.study.best_value} to {eval_f1}')
                         # self._best_eval_f1 = eval_f1
                         if Path(tuned_model_path).exists():
                             info(
                                 f'Overwriting {tuned_model_path} with model with best tuned hyperparameters so far')
                             rmtree(tuned_model_path)
                         else:
-                            info(f'Checkpoint with best tuned hyperparameters so far is {trainer.state.best_model_checkpoint}')
-                            info(f'Saving model (checkpoint) with best tuned hyperparameters so far into {tuned_model_path}')
+                            info(
+                                f'Checkpoint with best tuned hyperparameters so far is {trainer.state.best_model_checkpoint}')
+                            info(
+                                f'Saving model (checkpoint) with best tuned hyperparameters so far into {tuned_model_path}')
                         copytree(trainer.state.best_model_checkpoint, tuned_model_path)
                         info(f'Saving best choice of hyperparemeters so far into {params_override_path}')
                         OmegaConf.save(trial_params, params_override_path)
-
+                    else:
+                        info(f'Trial No. {trial.number} completed with evaluation metric {eval_f1}')
+                    # trial.study.sampler._rng._bit_generator.state = random_state1
+                    # trial.study.sampler._random_sampler._rng._bit_generator.state = random_state2
                     return eval_f1
 
             study_name = params.fine_tuning.study_name
             optuna_db = params.fine_tuning.optuna_db
             trials_storage = f'sqlite:///../db/{optuna_db}'
-            sampler = optuna.samplers.TPESampler(seed=seed)
+            sampler = optuna.samplers.TPESampler()
             pruner = optuna.pruners.NopPruner()
             study = optuna.create_study(study_name=study_name,
                                         storage=trials_storage,
@@ -202,8 +217,16 @@ def main(params: DictConfig) -> None:
                                         direction='maximize')
             study.optimize(func=trial_CB, n_trials=params.fine_tuning.n_trials)
 
+            mf.log_param('study_name', study.study_name)
+            mf.log_param('best_trial', study.best_trial.number)
+            mf.log_param('best_value', study.best_value)
+            mf.log_param('best_params', study.best_params)
+
             info(f'Hyperparameters tuning completed')
-            # TODO log stats here, also with MLFlow
+            info(f'  study_name {study.study_name}')
+            info(f'  best_trial {study.best_trial.number}')
+            info(f'  best_value {study.best_value}')
+            info(f'  best_params {study.best_params}')
 
     ''' Fine-tune the model if requested. Default hyperparameter values are taken from the config/params.yaml file, but 
     are then overridden by values taken from the models/saved_models/best_trial.yaml file if such file exists '''
@@ -215,7 +238,7 @@ def main(params: DictConfig) -> None:
             if Path(params_override_path).exists():
                 info(f'Loading parameters overried from {params_override_path}')
                 params_override = dict(OmegaConf.load(params_override_path))
-            res, trainer = train(model_init=get_model(), params_ovveride=params_override)
+            res, trainer = train(model_init=get_model, params_ovveride=params_override)
             info(f'Mode fine tuning results: {res}')
             trainer.save_model(tuned_model_path)
 
@@ -249,6 +272,7 @@ def main(params: DictConfig) -> None:
     ''' Test the saved fine-tuned model if required. That is the same model that would be used for inference '''
 
     if params.train.test:
+        info('Starting validation and test of the inference pipeline')
         with mf.start_run(run_name=get_name_for_run(), nested=True, description='inference testing with saved model'):
             info_active_run()
             model = AutoModelForSequenceClassification.from_pretrained(tuned_model_path)
@@ -258,24 +282,30 @@ def main(params: DictConfig) -> None:
             val_pred = pipe(emotions['validation']['text'])
             val_pred_labels = np.array([int(item['label'][-1]) for item in val_pred])
             y_val = np.array(emotions["validation"]["label"])
-            f1 = f1_score(y_val, val_pred_labels, average="weighted")
-            acc = accuracy_score(y_val, val_pred_labels)
+            eval_f1 = f1_score(y_val, val_pred_labels, average="weighted")
+            eval_acc = accuracy_score(y_val, val_pred_labels)
             info(
                 f'Validating inference pipeline with model loaded from {tuned_model_path} - dataset contains {len(y_val)} samples')
-            info(f'Validation f1 is {f1} and validation accuracy is {acc}')
+            info(f'Validation f1 is {eval_f1} and validation accuracy is {eval_acc}')
+            mf.log_params({'eval_f1': eval_f1, 'eval_acc': eval_acc})
+
+            fig_test = plot_confusion_matrix(val_pred_labels, y_val, labels, False)
+            mf.log_figure(fig_test, 'pipeline_validation_confusion_matrix.png')
 
             test_pred = pipe(emotions['test']['text'])
             test_pred_labels = np.array([int(item['label'][-1]) for item in test_pred])
             y_test = np.array(emotions["test"]["label"])
-            f1 = f1_score(y_test, test_pred_labels, average="weighted")
-            acc = accuracy_score(y_test, test_pred_labels)
+            test_f1 = f1_score(y_test, test_pred_labels, average="weighted")
+            test_acc = accuracy_score(y_test, test_pred_labels)
             info(
                 f'Testing inference pipeline with model loaded from {tuned_model_path} - dataset contains {len(y_test)} samples')
-            info(f'Test f1 is {f1} and test accuracy is {acc}')
-            # TODO log these metrics with MLFlow ---^
+            info(f'Test f1 is {test_f1} and test accuracy is {test_acc}')
+            mf.log_params({'test_f1': test_f1, 'test_acc': test_acc})
 
             fig_test = plot_confusion_matrix(test_pred_labels, y_test, labels, False)
             mf.log_figure(fig_test, 'pipeline_test_confusion_matrix.png')
+
+            info('Validation and test of the inference pipeline completed')
 
 
 if __name__ == '__main__':
