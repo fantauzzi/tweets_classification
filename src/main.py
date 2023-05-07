@@ -3,6 +3,7 @@ from pathlib import Path
 from shutil import copytree, rmtree
 
 import hydra
+import mlflow
 import mlflow as mf
 import numpy as np
 import optuna
@@ -166,6 +167,7 @@ def main(params: DictConfig) -> None:
                 with mf.start_run(run_name=get_name_for_run(),
                                   nested=True,
                                   description='trial for hyperparameters tuning'):
+                    mf.log_params({'trial.number': trial.number, 'study_name': study.study_name})
                     trial_params = {
                         'learning_rate': trial.suggest_float('learning_rate', 1e-6, 1e-4, log=True),
                         'per_device_train_batch_size': trial.suggest_categorical('per_device_train_batch_size',
@@ -214,6 +216,7 @@ def main(params: DictConfig) -> None:
                                         sampler=sampler,
                                         pruner=pruner,
                                         direction='maximize')
+            mlflow.log_param('study_name', study.study_name)
             study.optimize(func=trial_CB, n_trials=params.fine_tuning.n_trials)
 
             mf.log_param('study_name', study.study_name)
@@ -332,13 +335,12 @@ Fix reproducibility -> Done
 Make sure hyperparameters search works correctly -> Done
 Can fine-tuning be interrupted and resumed? -> Done, yes!
 Fix up call to optimize() -> Done
-
-Provide an easy way to coordinate the trial info (in the SQLite DB) with the run info in MLFlow
-Log with MLFlow the Optuna trial id of every nested run, also make sure the study name is logged
+Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
+    computed again later (is it even possible?) -> Done (yes it is)
+Provide an easy way to coordinate the trial info (in the SQLite DB) with the run info in MLFlow -> Done
+Log with MLFlow the Optuna trial id of every nested run, also make sure the study name is logged -> Done
 
 Tag the best nested run as such, will have to remove and re-assign the tag of best nested run as needed 
-Optimize hyper-parameters tuning such that it saves the best model so far at every trial, so it doesn't have to be
-    computed again later (is it even possible?)
 Log computation times
 Make a GUI via gradio and / or streamlit
 Version the saved model(also the dataset?)
