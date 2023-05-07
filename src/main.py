@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trai
     DistilBertForSequenceClassification
 
 from utils import info, warning, info_active_run, compute_metrics, get_name_for_run, plot_confusion_matrix, \
-    get_eval_f1_from_state_log
+    get_eval_f1_from_best_epoch
 
 
 @hydra.main(version_base='1.3', config_path='../config', config_name='params')
@@ -117,7 +117,8 @@ def main(params: DictConfig) -> None:
                 setattr(training_args, key, value)
 
         callbacks = [
-            transformers.EarlyStoppingCallback(early_stopping_patience=params.transformers.early_stopping_patience)]
+            transformers.EarlyStoppingCallback(
+                early_stopping_patience=params.transformers.early_stopping_patience)] if params.transformers.early_stopping_patience > 0 else []
 
         trainer = Trainer(model=model_init(),
                           args=training_args,
@@ -177,15 +178,15 @@ def main(params: DictConfig) -> None:
                     ''' Update information on the best trial so far as needed, and ensure the best trained model so
                     far is saved '''
 
-                    eval_f1 = get_eval_f1_from_state_log(trainer.state.log_history, res.global_step)
+                    eval_f1, best_loss, best_step = get_eval_f1_from_best_epoch(trainer.state.log_history)
+                    assert best_loss == trainer.state.best_metric
+                    info(f'eval_f1 {eval_f1} achieved at step {best_step} with eval_loss {best_loss}')
                     if not trial.study.best_trials or eval_f1 > trial.study.best_value:
-                        # if self._best_eval_f1 is None or self._best_eval_f1 < eval_f1:
                         if not trial.study.best_trials:
                             info(f'First trial completed with evaluation metric {eval_f1}')
                         else:
                             info(
                                 f'Current trial (No. {trial.number}) improved the evaluation metric from {trial.study.best_value} to {eval_f1}')
-                        # self._best_eval_f1 = eval_f1
                         if Path(tuned_model_path).exists():
                             info(
                                 f'Overwriting {tuned_model_path} with model with best tuned hyperparameters so far, coming from checkpoint {trainer.state.best_model_checkpoint}')

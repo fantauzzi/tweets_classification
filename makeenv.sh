@@ -1,4 +1,3 @@
-pip install --upgrade pip
 
 # pyenv setup
 sudo apt update

@@ -135,8 +135,29 @@ def plot_confusion_matrix(y_preds, y_true, labels, show=True):
     return fig
 
 
+"""
 def get_eval_f1_from_state_log(log_history: list[dict], step: int) -> float:
     for entry in log_history:
         if entry.get('step') == step and entry.get('eval_f1') is not None:
             return entry['eval_f1']
     assert False
+"""
+
+
+def get_eval_f1_from_best_epoch(log_history: list[dict]) -> (float, float, int):
+    """
+    Returns evaluation F1, evaluation loss and step number for the step with the lowest evaluation loss in a given
+    Trainer.state.log_history
+    :param log_history: the given Trainer.state.log_history
+    :return: a triple with, in this order, the required F1 score, loss and step number
+    """
+    lowest_eval_loss = None
+    step = None
+    eval_f1 = None
+    for entry in log_history:
+        eval_loss = entry.get('eval_loss')
+        if eval_loss is not None and (lowest_eval_loss is None or eval_loss < lowest_eval_loss):
+            lowest_eval_loss = eval_loss
+            step = entry['step']
+            eval_f1 = entry['eval_f1']
+    return eval_f1, lowest_eval_loss, step
